@@ -474,6 +474,12 @@ pub enum ReconciliationDifferenceKind {
 pub struct ReconciliationDifference {
     pub kind: ReconciliationDifferenceKind,
     pub subject: String,
+    /// Canonical, bounded textual value used on the local side of the exact
+    /// comparison. `None` means the value was absent, not zero.
+    pub local_value: Option<String>,
+    /// Canonical, bounded textual value used on the broker side of the exact
+    /// comparison. `None` means the value was absent, not zero.
+    pub broker_value: Option<String>,
     pub detail: String,
 }
 
@@ -716,6 +722,8 @@ mod tests {
             differences: vec![ReconciliationDifference {
                 kind: ReconciliationDifferenceKind::CashMismatch,
                 subject: "cash".into(),
+                local_value: Some("1.00".into()),
+                broker_value: Some("0.99".into()),
                 detail: "one cent".into(),
             }],
             may_resume_execution: true,

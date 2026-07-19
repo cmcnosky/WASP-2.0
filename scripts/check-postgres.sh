@@ -78,6 +78,67 @@ docker exec --interactive "$container_name" psql \
   --set=ON_ERROR_STOP=1 \
   --file=- <"$invariant_test"
 
+observer_invariant_test="$repo_root/tests/sql/observer_invariants.sql"
+if [[ ! -f "$observer_invariant_test" ]]; then
+  printf 'Required SQL observer invariant test is missing: tests/sql/observer_invariants.sql\n' >&2
+  exit 1
+fi
+
+printf 'running tests/sql/observer_invariants.sql\n'
+docker exec --interactive "$container_name" psql \
+  --username "$database_user" \
+  --dbname "$database_name" \
+  --set=ON_ERROR_STOP=1 \
+  --file=- <"$observer_invariant_test"
+
+observer_store_source="$repo_root/crates/trader-execution/src/observer_store.rs"
+observer_verifier_sql="$(awk '
+  $0 == "const OBSERVER_SCHEMA_AND_PRIVILEGES_SQL: &str = r#\"" {
+    in_query = 1
+    next
+  }
+  in_query && $0 == "\"#;" { exit }
+  in_query { print }
+' "$observer_store_source")"
+if [[ -z "$observer_verifier_sql" ]]; then
+  printf 'Could not extract the exact Rust observer schema verifier\n' >&2
+  exit 1
+fi
+
+observer_login='check_observer_paper'
+docker exec "$container_name" psql \
+  --username "$database_user" \
+  --dbname "$database_name" \
+  --set=ON_ERROR_STOP=1 \
+  --command="CREATE ROLE $observer_login LOGIN INHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS; GRANT alpaca_trader_observer TO $observer_login;" \
+  >/dev/null
+
+printf 'running exact Rust observer session verifier\n'
+observer_verifier_output="$(printf '%s\n' "$observer_verifier_sql" | docker exec --interactive "$container_name" psql \
+  --username "$observer_login" \
+  --dbname "$database_name" \
+  --set=ON_ERROR_STOP=1 \
+  --tuples-only \
+  --no-align \
+  --field-separator='|' \
+  --file=-)"
+observer_verifier_failures="$(printf '%s\n' "$observer_verifier_output" | awk -F '|' '
+  NF != 2 || $2 != "t" { failures += 1 }
+  END { print failures + 0 }
+')"
+if [[ -z "$observer_verifier_output" || "$observer_verifier_failures" -ne 0 ]]; then
+  printf 'Exact Rust observer session verifier rejected the migrated schema\n' >&2
+  printf '%s\n' "$observer_verifier_output" >&2
+  exit 1
+fi
+
+docker exec "$container_name" psql \
+  --username "$database_user" \
+  --dbname "$database_name" \
+  --set=ON_ERROR_STOP=1 \
+  --command="REVOKE alpaca_trader_observer FROM $observer_login; DROP ROLE $observer_login;" \
+  >/dev/null
+
 concurrency_setup="$repo_root/tests/sql/concurrency_setup.sql"
 concurrency_assertions="$repo_root/tests/sql/concurrency_assertions.sql"
 if [[ ! -f "$concurrency_setup" || ! -f "$concurrency_assertions" ]]; then
