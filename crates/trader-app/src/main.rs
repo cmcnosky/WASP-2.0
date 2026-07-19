@@ -8,6 +8,7 @@ use trader_core::{
     RiskLimitSnapshot, StrategyRelease,
 };
 use trader_execution::config::RuntimeConfig;
+use trader_execution::observer_runtime::run_paper_observer_from_env;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -64,6 +65,8 @@ enum Command {
         #[arg(long)]
         quote: PathBuf,
     },
+    /// Run the supervised GET-only paper observer. Secrets are environment-only.
+    PaperObserver,
 }
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T> {
@@ -76,7 +79,8 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Health { local } => {
             if !local {
@@ -132,6 +136,14 @@ fn main() -> Result<()> {
             print_json(&materialize_order_intent(
                 &snapshot, &release, &risk, &plan, &quote,
             )?)
+        }
+        Command::PaperObserver => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .json()
+                .try_init();
+            run_paper_observer_from_env().await?;
+            Ok(())
         }
     }
 }

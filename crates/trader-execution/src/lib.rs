@@ -13,6 +13,7 @@ pub mod http_transport;
 pub mod ledger;
 pub mod lifecycle;
 pub mod observer_database;
+pub mod observer_runtime;
 pub mod observer_store;
 pub mod port;
 pub mod rate_limit;

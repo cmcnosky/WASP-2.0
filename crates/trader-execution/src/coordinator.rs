@@ -57,7 +57,7 @@ impl PaperReadOnlyConfig {
         CoordinatorMode::ReconcileOnly
     }
 
-    fn validate(&self) -> Result<(), CoordinatorError> {
+    pub fn validate(&self) -> Result<(), CoordinatorError> {
         if self.owner_id.is_nil() {
             return Err(CoordinatorError::UnsafeConfiguration(
                 "coordinator owner ID must not be nil".into(),
@@ -387,6 +387,29 @@ pub enum StartupFailureStage {
     Shutdown,
 }
 
+/// Durable reason a read-only observer cycle was started.
+///
+/// This is part of the cycle identity. A periodic supervisor must never write
+/// every cycle as `startup`, and a reconnect audit must remain distinguishable
+/// from both process startup and ordinary scheduling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObserverCycleTrigger {
+    Startup,
+    Periodic,
+    Reconnect,
+}
+
+impl ObserverCycleTrigger {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Periodic => "periodic",
+            Self::Reconnect => "reconnect",
+        }
+    }
+}
+
 /// Deterministic durable identity for the open observer cycle.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -422,6 +445,7 @@ pub struct ObserverCycle {
     account_fingerprint: HashDigest,
     owner_id: Uuid,
     fencing_token: u64,
+    trigger: ObserverCycleTrigger,
     started_at: DateTime<Utc>,
     evidence_hash: HashDigest,
 }
@@ -430,13 +454,15 @@ impl ObserverCycle {
     fn new(
         config: &PaperReadOnlyConfig,
         lease: &PaperObserverLease,
+        trigger: ObserverCycleTrigger,
         started_at: DateTime<Utc>,
     ) -> Result<Self, CoordinatorError> {
         let identity = format!(
-            "paper-observer-cycle/v1:{}:{}:{}:{}",
+            "paper-observer-cycle/v1:{}:{}:{}:{}:{}",
             config.expected_account_fingerprint,
             config.owner_id,
             lease.fencing_token,
+            trigger.as_str(),
             started_at.to_rfc3339()
         );
         let cycle_id = Uuid::new_v5(&OBSERVER_CYCLE_NAMESPACE, identity.as_bytes());
@@ -448,6 +474,7 @@ impl ObserverCycle {
             account_fingerprint: config.expected_account_fingerprint,
             owner_id: config.owner_id,
             fencing_token: lease.fencing_token,
+            trigger,
             started_at,
         };
         let evidence_hash = HashDigest::of_json(&material)
@@ -460,6 +487,7 @@ impl ObserverCycle {
             account_fingerprint: config.expected_account_fingerprint,
             owner_id: config.owner_id,
             fencing_token: lease.fencing_token,
+            trigger,
             started_at,
             evidence_hash,
         })
@@ -500,6 +528,10 @@ impl ObserverCycle {
         self.fencing_token
     }
 
+    pub const fn trigger(&self) -> ObserverCycleTrigger {
+        self.trigger
+    }
+
     pub const fn started_at(&self) -> DateTime<Utc> {
         self.started_at
     }
@@ -518,6 +550,7 @@ struct ObserverCycleHashMaterial {
     account_fingerprint: HashDigest,
     owner_id: Uuid,
     fencing_token: u64,
+    trigger: ObserverCycleTrigger,
     started_at: DateTime<Utc>,
 }
 
@@ -740,6 +773,34 @@ where
     B: ReadOnlyBroker,
     C: CoordinatorClock,
 {
+    run_observer_reconciliation(
+        config,
+        store,
+        broker,
+        ObserverCycleTrigger::Startup,
+        started_at,
+        clock,
+    )
+    .await
+}
+
+/// Runs one fail-closed observer reconciliation with an explicit durable
+/// trigger. The startup wrapper above remains for callers that perform only a
+/// single startup check; long-running supervisors must use this function so
+/// periodic and reconnect evidence cannot masquerade as startup evidence.
+pub async fn run_observer_reconciliation<S, B, C>(
+    config: &PaperReadOnlyConfig,
+    store: &mut S,
+    broker: &mut B,
+    trigger: ObserverCycleTrigger,
+    started_at: DateTime<Utc>,
+    clock: &C,
+) -> Result<StartupResult, CoordinatorError>
+where
+    S: CoordinatorStore,
+    B: ReadOnlyBroker,
+    C: CoordinatorClock,
+{
     config.validate()?;
     let snapshot_timeout = config.snapshot_timeout()?;
 
@@ -756,7 +817,7 @@ where
         return Err(CoordinatorError::FenceLost);
     }
 
-    let cycle = ObserverCycle::new(config, &initial_lease, started_at)?;
+    let cycle = ObserverCycle::new(config, &initial_lease, trigger, started_at)?;
     begin_cycle(store, &cycle, &initial_lease).await?;
 
     let local = match store.load_local_projection(&cycle, &initial_lease).await {

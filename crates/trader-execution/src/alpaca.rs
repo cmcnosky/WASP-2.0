@@ -456,7 +456,7 @@ impl Drop for FingerprintSalt {
 }
 
 impl<T> AlpacaReadOnlyBroker<T> {
-    pub fn new(
+    fn new(
         adapter: AlpacaPaperAdapter<T>,
         mut fingerprint_salt: Vec<u8>,
     ) -> Result<Self, CoordinatorPortError> {
@@ -470,6 +470,36 @@ impl<T> AlpacaReadOnlyBroker<T> {
             adapter,
             fingerprint_salt: FingerprintSalt(fingerprint_salt),
         })
+    }
+}
+
+impl AlpacaReadOnlyBroker<crate::http_transport::ReadOnlyReqwestTransport> {
+    /// Constructs the only credential-bearing broker admitted to the observer
+    /// composition root. The generic adapter and mutation-capable transport
+    /// never cross this boundary.
+    pub(crate) fn from_read_only_env(
+        mut fingerprint_salt: Vec<u8>,
+    ) -> Result<Self, CoordinatorPortError> {
+        let transport = match crate::http_transport::ReadOnlyReqwestTransport::from_env() {
+            Ok(transport) => transport,
+            Err(_) => {
+                fingerprint_salt.fill(0);
+                return Err(read_only_configuration_error());
+            }
+        };
+        let adapter = match AlpacaPaperAdapter::new(
+            Environment::Paper,
+            PAPER_TRADING_API,
+            MARKET_DATA_API,
+            transport,
+        ) {
+            Ok(adapter) => adapter,
+            Err(_) => {
+                fingerprint_salt.fill(0);
+                return Err(read_only_configuration_error());
+            }
+        };
+        Self::new(adapter, fingerprint_salt)
     }
 }
 

@@ -67,7 +67,7 @@ license inventory to agree before any external deployment.
 | `tokio-postgres-rustls 0.14.0` | Rustls integration and hostname-verified TLS for the RDS PostgreSQL client | [upstream repository](https://github.com/jbg/tokio-postgres-rustls/tree/v0.14.0) | MIT | Current 2026-05-21 release; direct TLS/network boundary with no telemetry, unsafe code forbidden upstream, and no default features; AWS-LC is selected explicitly; preferred over OpenSSL/native-TLS runtime dependencies; reviewed by Codex on 2026-07-19 |
 | `tracing 0.1.44` | Structured telemetry | crates.io | MIT | Redaction/allowlisting required; admitted |
 | `tracing-subscriber 0.3.23` | Controlled log formatting/filtering | crates.io | MIT | No dynamic remote filter; admitted |
-| `uuid 1.10.0` | Stable domain and intent identifiers | crates.io | MIT OR Apache-2.0 | Deterministic client-ID derivation remains internal; admitted |
+| `uuid 1.10.0` | Stable domain and intent identifiers | crates.io | MIT OR Apache-2.0 | V5 deterministic client-ID derivation remains internal; V4 supplies a fresh non-secret observer owner per process so overlapping tasks cannot share lease identity; admitted |
 | `setuptools 83.0.0` | Build the dependency-free Python research package | PyPI | MIT | Exact build-only pin; admitted |
 | AWS/archive Terraform providers `5.100.0`/`2.8.0` | Managed AWS IaC and dead-man package | HashiCorp Registry | MPL-2.0 | Locked checksums; admitted for private IaC |
 | Terraform CLI `1.8.5` | Format and validate IaC | HashiCorp releases | BUSL-1.1 | Tool-only private use; operator must re-review terms before material reuse |
