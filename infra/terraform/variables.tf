@@ -131,6 +131,36 @@ variable "expected_rds_ca_bundle_sha256" {
   }
 }
 
+variable "expected_alpaca_account_fingerprint" {
+  description = "Non-secret salted SHA-256 fingerprint independently derived for the exact paper Alpaca account."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = var.expected_alpaca_account_fingerprint == null ? true : (
+      can(regex("^[0-9a-f]{64}$", var.expected_alpaca_account_fingerprint)) &&
+      var.expected_alpaca_account_fingerprint != "0000000000000000000000000000000000000000000000000000000000000000"
+    )
+    error_message = "expected_alpaca_account_fingerprint must be null or a nonzero 64-character lowercase SHA-256 digest."
+  }
+}
+
+variable "expected_observer_database_host_sha256" {
+  description = "Non-secret SHA-256 of the independently reviewed paper RDS hostname."
+  type        = string
+  default     = null
+  nullable    = true
+
+  validation {
+    condition = var.expected_observer_database_host_sha256 == null ? true : (
+      can(regex("^[0-9a-f]{64}$", var.expected_observer_database_host_sha256)) &&
+      var.expected_observer_database_host_sha256 != "0000000000000000000000000000000000000000000000000000000000000000"
+    )
+    error_message = "expected_observer_database_host_sha256 must be null or a nonzero 64-character lowercase SHA-256 digest."
+  }
+}
+
 variable "execution_mode" {
   description = "Broker mutation authority requested for this deployment. Defaults fail-closed."
   type        = string
@@ -143,7 +173,7 @@ variable "execution_mode" {
 }
 
 variable "deploy_application" {
-  description = "Reserved paper read-only deployment switch; currently blocked until the long-running observer entrypoint is implemented and tested."
+  description = "Reserved paper read-only deployment switch; currently blocked pending runtime-aware health and external observer evidence."
   type        = bool
   default     = false
 }

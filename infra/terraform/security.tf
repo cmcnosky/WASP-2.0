@@ -178,6 +178,34 @@ resource "aws_secretsmanager_secret" "runtime_database" {
   })
 }
 
+resource "aws_secretsmanager_secret" "paper_observer_database" {
+  count = local.is_live ? 0 : 1
+
+  name                    = "${local.name_prefix}/paper-observer-database"
+  description             = "GET-only observer username/password plus approved RDS root PEM; never the runtime or RDS master login"
+  kms_key_id              = aws_kms_key.main.arn
+  recovery_window_in_days = 7
+
+  tags = merge(local.common_tags, {
+    Name          = "${local.name_prefix}-paper-observer-database"
+    CredentialFor = "paper-observer-database-only"
+  })
+}
+
+resource "aws_secretsmanager_secret" "paper_observer_identity" {
+  count = local.is_live ? 0 : 1
+
+  name                    = "${local.name_prefix}/paper-observer-identity"
+  description             = "Stable paper account-fingerprint salt only; populate account_fingerprint_salt_hex out of band"
+  kms_key_id              = aws_kms_key.main.arn
+  recovery_window_in_days = 7
+
+  tags = merge(local.common_tags, {
+    Name          = "${local.name_prefix}-paper-observer-identity"
+    CredentialFor = "paper-observer-fingerprint-only"
+  })
+}
+
 # Intentionally no aws_secretsmanager_secret_version resources. Terraform state
 # must contain neither broker nor database credential values. The operator
-# populates both secrets out of band after the least-privilege role is created.
+# populates every secret out of band after the least-privilege role is created.

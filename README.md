@@ -51,7 +51,11 @@ docker build --build-arg APP_PACKAGE=alpaca-autotrader -t alpaca-autotrader:dev 
 
 The image runs as an unprivileged user and exposes no inbound application port.
 Its health check calls `alpaca-autotrader health --local`, which must not use the
-network or broker credentials.
+network or broker credentials. That command is an image/process smoke check,
+not runtime readiness. `./scripts/check-container-contract.sh` builds the exact
+image, verifies its entrypoint/nonroot identity, exercises local health without
+network access, and proves `paper-observer` rejects missing configuration before
+any network operation.
 
 ## Repository map
 

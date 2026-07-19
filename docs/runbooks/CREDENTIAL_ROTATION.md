@@ -7,6 +7,9 @@
 2. The operator creates a replacement key through Alpaca and writes JSON keys
    `api_key_id` and `api_secret_key` directly to the environment-specific
    Secrets Manager secret. Do not use Terraform secret values or CLI arguments.
+   Do not rotate or move `account_fingerprint_salt_hex`; it is held separately
+   in the paper observer identity secret and must remain stable so account
+   identity does not change merely because an API key changed.
 3. Stop-before-start deploy/restart the task. It reads the new version at
    startup, authenticates with a bounded account request, verifies the account
    fingerprint, and remains read-only while reconciling.

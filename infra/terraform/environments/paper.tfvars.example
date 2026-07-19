@@ -4,6 +4,8 @@ aws_region              = "us-east-1"
 database_name           = "alpaca_autotrader_paper"
 rds_ca_cert_identifier  = "rds-ca-rsa2048-g1"
 expected_rds_ca_bundle_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+expected_alpaca_account_fingerprint = null
+expected_observer_database_host_sha256 = null
 
 vpc_cidr                   = "10.42.0.0/16"
 public_subnet_cidrs         = ["10.42.0.0/24", "10.42.1.0/24"]
@@ -18,3 +20,5 @@ alert_email               = null
 create_account_budget     = false
 
 # No broker, cloud, database, signing, or personal credentials belong here.
+# Keep the two expected digests null until the safe fingerprint-bootstrap and
+# independent RDS-host review steps are complete.

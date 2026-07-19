@@ -41,17 +41,33 @@ locals {
     !var.deploy_application ||
     (var.environment == "paper" && var.execution_mode == "read_only")
   )
-  # Keep deployment mechanically unavailable until the binary has a tested,
-  # long-running observer entrypoint. An approval reference cannot substitute
-  # for code that does not yet exist.
-  observer_entrypoint_is_implemented = false
-  deployment_has_observer_entrypoint = (
-    !var.deploy_application || local.observer_entrypoint_is_implemented
+  # The stopped task definition now selects and configures the GET-only paper
+  # observer. Deployment remains mechanically closed until the runtime-aware
+  # health, image-attestation, fingerprint-bootstrap, and real RDS/container
+  # evidence called out in the runbook exist. An approval reference cannot
+  # substitute for those missing controls.
+  observer_task_wiring_is_implemented = true
+  observer_deployment_evidence_exists = false
+  deployment_has_observer_wiring = (
+    !var.deploy_application || local.observer_task_wiring_is_implemented
+  )
+  deployment_has_observer_evidence = (
+    !var.deploy_application || local.observer_deployment_evidence_exists
+  )
+  deployment_has_observer_inputs = (
+    !var.deploy_application || (
+      var.expected_alpaca_account_fingerprint != null &&
+      var.expected_observer_database_host_sha256 != null
+    )
   )
   mutation_has_runtime = var.execution_mode == "read_only" || var.deploy_application
   deployment_has_real_ca_digest = (
     !var.deploy_application ||
     var.expected_rds_ca_bundle_sha256 != "0000000000000000000000000000000000000000000000000000000000000000"
+  )
+  deployment_has_real_image_digest = (
+    !var.deploy_application ||
+    var.container_image_digest != "sha256:0000000000000000000000000000000000000000000000000000000000000000"
   )
   fargate_cpu_memory_pair_is_supported = (
     (var.container_cpu == 256 && contains([512, 1024, 2048], var.container_memory)) ||
