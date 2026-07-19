@@ -16,6 +16,11 @@ import boto3
 cloudwatch = boto3.client("cloudwatch")
 
 
+def heartbeat_is_healthy(age_seconds: float, maximum_age_seconds: int, value: float) -> bool:
+    """Reject missing, stale, unhealthy, and future-dated heartbeat evidence."""
+    return 0 <= age_seconds <= maximum_age_seconds and value >= 1
+
+
 def handler(_event: dict[str, Any], _context: Any) -> dict[str, Any]:
     namespace = os.environ["METRIC_NAMESPACE"]
     environment = os.environ["ENVIRONMENT"]
@@ -38,7 +43,9 @@ def handler(_event: dict[str, Any], _context: Any) -> dict[str, Any]:
     healthy = False
     if newest is not None:
         age_seconds = (now - newest["Timestamp"]).total_seconds()
-        healthy = age_seconds <= maximum_age_seconds and newest.get("Maximum", 0) >= 1
+        healthy = heartbeat_is_healthy(
+            age_seconds, maximum_age_seconds, newest.get("Maximum", 0)
+        )
 
     cloudwatch.put_metric_data(
         Namespace=namespace,

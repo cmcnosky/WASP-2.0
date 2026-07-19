@@ -10,13 +10,14 @@ Terraform success is not order authority. The default `execution_mode` is
 the application must validate the actual signed activation permit and broker
 account fingerprint.
 
-The current binary has bounded CLI commands but no long-running reconcile loop.
-Terraform therefore defaults `deploy_application=false`, keeping ECS desired
-count at zero. Do not set it true until that runtime exists, its local health
-check and shutdown behavior pass, and `runtime_ready_approval_id` identifies the
-review evidence. Runtime alarms are not created and the dead-man schedule stays
-disabled while the task is intentionally absent; there is no fake heartbeat
-process. Infrastructure/database alarms remain active.
+The current binary has a long-running GET-only `paper-observer` command, but the
+task definition does not yet select it or inject its dedicated database,
+fingerprint, salt, metric, and image-attestation inputs. Terraform therefore
+defaults `deploy_application=false`, keeping ECS desired count at zero. Do not
+set it true until that task wiring and its real RDS/container failure paths pass
+review and `runtime_ready_approval_id` identifies the evidence. Runtime alarms
+are not created and the dead-man schedule stays disabled while the task is
+intentionally absent; there is no fake heartbeat process.
 
 ## Resources
 
@@ -81,10 +82,10 @@ split the approved rollout into two saved plans:
    to ECS.
 4. Populate the Alpaca secret directly with JSON keys `api_key_id` and
    `api_secret_key`; do not print either secret.
-5. Keep `deploy_application=false` while the image lacks a long-running
-   reconcile loop. After that implementation and review, set its approval ID and
-   plan the digest-pinned task/service; confirm no public IP/inbound rule, desired
-   count one, and read-only execution mode.
+5. Keep `deploy_application=false` while the task lacks reviewed observer
+   command/secret/IAM wiring and real RDS/container evidence. After that review,
+   set its approval ID and plan the digest-pinned task/service; confirm no public
+   IP/inbound rule, desired count one, and read-only execution mode.
 
 If a staged first apply is operationally inconvenient, refactor foundation and
 runtime into distinct states before provisioning; do not use a placeholder image
@@ -102,8 +103,8 @@ every other named resource and state still remains distinct.
 The current Terraform revision cannot deploy an application task: the task
 precondition is closed and the GitHub OIDC role may publish images but is
 explicitly denied ECS deployment and `iam:PassRole`. A later reviewed code
-change must remove both holds only after the observer entrypoint is implemented
-and tested. Live would then start in read-only for at least five reconciled
+change must remove both holds only after the observer task composition is wired,
+tested against real paper/RDS boundaries, and operator-approved. Live would then start in read-only for at least five reconciled
 trading sessions; mutation still requires the complete live-readiness runbook.
 
 ## Validation and drills
