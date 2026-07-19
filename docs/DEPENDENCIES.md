@@ -69,6 +69,8 @@ license inventory to agree before any external deployment.
 | Terraform CLI `1.8.5` | Format and validate IaC | HashiCorp releases | BUSL-1.1 | Tool-only private use; operator must re-review terms before material reuse |
 | Rust 1.88, Python 3.12, PostgreSQL 17, Distroless Debian 12 images | Build, checks, database, runtime | Official OCI publishers | Mixed; image SBOM controls | Digest-pinned; release scan/license inventory required |
 | Pinned GitHub Actions and CI audit/lint tools | Checkout, tool setup, SBOM, scan, tests | Official project repositories/registries | Primarily MIT/Apache-2.0 | Commit-pinned actions; build-only; Dependabot monitored |
+| `aquasecurity/trivy-action v0.36.0` (`ed142fd0673e97e23eac54620cfb913e5ce36c25`) | Scan the built OCI image for release-blocking vulnerabilities in CI | github.com/aquasecurity/trivy-action | Apache-2.0 | Replaces the broken v0.28.0 action pin; exact upstream commit, CI/build-only access, no production runtime dependency |
+| `docker/setup-buildx-action v4.2.0` (`bb05f3f5519dd87d3ba754cc423b652a5edd6d2c`) | Provide the container-backed Buildx driver required for OCI provenance and SBOM attestations | github.com/docker/setup-buildx-action | MIT | Exact upstream commit, CI/build-only Docker control; avoids the hosted runner's non-attestation Docker driver |
 
 The Python research package has no runtime PyPI dependency. AWS services and
 Alpaca are external services governed by their account agreements rather than
