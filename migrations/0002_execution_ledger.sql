@@ -77,7 +77,9 @@ CREATE TABLE order_intents (
     quote_received_at TIMESTAMPTZ NOT NULL,
     quote_valid_until TIMESTAMPTZ NOT NULL,
     quote_payload_hash TEXT NOT NULL CHECK (quote_payload_hash ~ '^[0-9a-f]{64}$'),
-    evidence_hash TEXT NOT NULL CHECK (evidence_hash ~ '^[0-9a-f]{64}$'),
+    decision_evidence_hash TEXT NOT NULL CHECK (decision_evidence_hash ~ '^[0-9a-f]{64}$'),
+    materialization_evidence_hash TEXT NOT NULL
+        CHECK (materialization_evidence_hash ~ '^[0-9a-f]{64}$'),
     created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     UNIQUE (environment, account_fingerprint, client_order_id),
     CHECK (quote_provider_at > decision_at),

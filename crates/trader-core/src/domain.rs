@@ -389,7 +389,8 @@ pub enum TimeInForce {
     Day,
 }
 
-/// Broker-independent order delta. It deliberately has no executable price.
+/// Broker-independent order delta. It deliberately has no executable price,
+/// but retains the raw decision-time price used by strategy and risk.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OrderPlan {
@@ -399,6 +400,7 @@ pub struct OrderPlan {
     pub symbol: Symbol,
     pub side: OrderSide,
     pub quantity: WholeQuantity,
+    pub decision_reference_price: Price,
     pub decision_evidence_hash: HashDigest,
     pub created_at: DateTime<Utc>,
 }
@@ -410,9 +412,10 @@ pub struct OrderPlan {
 pub struct FreshExecutionQuote {
     pub symbol: Symbol,
     pub raw_price: Price,
-    pub observed_at: DateTime<Utc>,
+    pub provider_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
     pub valid_until: DateTime<Utc>,
-    pub source_hash: HashDigest,
+    pub payload_hash: HashDigest,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -426,11 +429,18 @@ pub struct OrderIntent {
     pub side: OrderSide,
     pub quantity: WholeQuantity,
     pub limit_price: Price,
-    pub quote_observed_at: DateTime<Utc>,
+    pub decision_at: DateTime<Utc>,
+    pub arrival_quote: Price,
+    pub quote_provider_at: DateTime<Utc>,
+    pub quote_received_at: DateTime<Utc>,
     pub quote_valid_until: DateTime<Utc>,
-    pub quote_source_hash: HashDigest,
+    pub quote_payload_hash: HashDigest,
     pub time_in_force: TimeInForce,
+    /// Hash of the released decision, risk result, and non-executable plan.
     pub decision_evidence_hash: HashDigest,
+    /// Hash of the complete materialization inputs, including raw quote
+    /// evidence and the resulting executable limit price.
+    pub materialization_evidence_hash: HashDigest,
     pub created_at: DateTime<Utc>,
 }
 

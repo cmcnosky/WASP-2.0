@@ -263,7 +263,7 @@ BEGIN
           AND plan.symbol = NEW.symbol
           AND plan.side = NEW.side
           AND plan.whole_quantity = NEW.whole_quantity
-          AND plan.decision_evidence_hash = NEW.evidence_hash
+          AND plan.decision_evidence_hash = NEW.decision_evidence_hash
           AND plan.created_at = NEW.decision_at
     ) THEN
         RAISE EXCEPTION 'materialized order intent differs from its approved order plan';
