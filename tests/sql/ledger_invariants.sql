@@ -285,7 +285,7 @@ INSERT INTO order_intents (
     account_fingerprint, client_order_id, symbol, side, whole_quantity,
     order_type, limit_price, time_in_force, decision_at, arrival_quote,
     quote_provider_at, quote_received_at, quote_valid_until,
-    quote_payload_hash, evidence_hash
+    quote_payload_hash, decision_evidence_hash, materialization_evidence_hash
 ) VALUES (
     '73000000-0000-0000-0000-000000000001',
     '72500000-0000-0000-0000-000000000001',
@@ -306,8 +306,56 @@ INSERT INTO order_intents (
     clock_timestamp() - INTERVAL '1 second',
     clock_timestamp() + INTERVAL '10 seconds',
     repeat('d', 64),
-    repeat('6', 64)
+    repeat('6', 64),
+    repeat('7', 64)
 );
+
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO order_intents (
+            intent_id, order_plan_id, risk_decision_id, strategy_release_id, environment,
+            account_fingerprint, client_order_id, symbol, side, whole_quantity,
+            order_type, limit_price, time_in_force, decision_at, arrival_quote,
+            quote_provider_at, quote_received_at, quote_valid_until,
+            quote_payload_hash, decision_evidence_hash, materialization_evidence_hash
+        )
+        SELECT
+            '73000000-0000-0000-0000-000000000099',
+            order_plan_id,
+            risk_decision_id,
+            strategy_release_id,
+            environment,
+            account_fingerprint,
+            'test-mismatched-decision-evidence',
+            symbol,
+            side,
+            whole_quantity,
+            order_type,
+            limit_price,
+            time_in_force,
+            decision_at,
+            arrival_quote,
+            quote_provider_at,
+            quote_received_at,
+            quote_valid_until,
+            quote_payload_hash,
+            repeat('0', 64),
+            materialization_evidence_hash
+        FROM order_intents
+        WHERE intent_id = '73000000-0000-0000-0000-000000000001';
+        RAISE EXCEPTION 'intent accepted mismatched decision evidence';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM = 'intent accepted mismatched decision evidence' THEN
+                RAISE;
+            END IF;
+            IF SQLERRM <> 'materialized order intent differs from its approved order plan' THEN
+                RAISE;
+            END IF;
+    END;
+END;
+$$;
 
 INSERT INTO intent_state_events (
     intent_state_event_id, intent_id, state, reason_code,

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use chrono::Duration;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -99,6 +100,7 @@ pub fn plan_orders(
             symbol: approved.symbol.clone(),
             side,
             quantity: WholeQuantity::new(quantity),
+            decision_reference_price: approved.raw_reference_price,
             decision_evidence_hash: evidence,
             created_at: snapshot.as_of,
         });
@@ -147,12 +149,15 @@ pub fn materialize_order_intent(
             "order plan is not an exact output of the authorized decision".into(),
         ));
     }
-    if quote.observed_at <= snapshot.as_of
-        || quote.valid_until <= quote.observed_at
+    let quote_validity = quote.valid_until.signed_duration_since(quote.received_at);
+    if quote.provider_at <= snapshot.as_of
+        || quote.received_at < quote.provider_at
+        || quote_validity <= Duration::zero()
+        || quote_validity > Duration::seconds(15)
         || !quote.raw_price.fixed().is_positive()
     {
         return Err(CoreError::InvalidDomain(
-            "execution quote is stale, pre-decision, or non-positive".into(),
+            "execution quote has invalid price, provenance ordering, or validity window".into(),
         ));
     }
     let band = Fixed::from_scaled(i128::from(risk.limits.marketable_limit_band_bps) * 100);
@@ -213,7 +218,7 @@ pub fn materialize_order_intent(
         }
     }
     let release_hash = release.release_hash()?;
-    let evidence = HashDigest::of_json(&(
+    let materialization_evidence = HashDigest::of_json(&(
         &snapshot.input_data_hash,
         &snapshot.account_snapshot_hash,
         &snapshot.account.account_fingerprint,
@@ -223,7 +228,7 @@ pub fn materialize_order_intent(
         &quote,
         limit_price,
     ))?;
-    let stable_material = format!("{}:{}", plan.plan_id, evidence);
+    let stable_material = format!("{}:{}", plan.plan_id, materialization_evidence);
     let intent_uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, stable_material.as_bytes());
     let client_hash = HashDigest::sha256(stable_material.as_bytes()).as_hex();
     Ok(OrderIntent {
@@ -235,11 +240,15 @@ pub fn materialize_order_intent(
         side: plan.side,
         quantity: plan.quantity,
         limit_price,
-        quote_observed_at: quote.observed_at,
+        decision_at: snapshot.as_of,
+        arrival_quote: quote.raw_price,
+        quote_provider_at: quote.provider_at,
+        quote_received_at: quote.received_at,
         quote_valid_until: quote.valid_until,
-        quote_source_hash: quote.source_hash,
+        quote_payload_hash: quote.payload_hash,
         time_in_force: TimeInForce::Day,
-        decision_evidence_hash: evidence,
-        created_at: quote.observed_at,
+        decision_evidence_hash: plan.decision_evidence_hash,
+        materialization_evidence_hash: materialization_evidence,
+        created_at: quote.received_at,
     })
 }

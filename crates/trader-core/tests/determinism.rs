@@ -104,6 +104,10 @@ fn identical_inputs_produce_byte_identical_decisions_and_ids() {
     assert_eq!(first.risk.disposition, RiskDisposition::Reduced);
     assert_eq!(first.order_plans.len(), 1);
     assert_eq!(first.order_plans[0].plan_id, second.order_plans[0].plan_id);
+    assert_eq!(
+        first.order_plans[0].decision_reference_price,
+        first.risk.approved_positions[0].raw_reference_price
+    );
     assert_ne!(
         first.target.positions[0].raw_reference_price,
         snapshot.observations.last().unwrap().total_return_close
@@ -175,22 +179,99 @@ fn intent_requires_a_fresh_raw_post_decision_quote() {
     let predecision = FreshExecutionQuote {
         symbol: plan.symbol.clone(),
         raw_price: "57".parse().unwrap(),
-        observed_at: snapshot.as_of,
+        provider_at: snapshot.as_of,
+        received_at: snapshot.as_of + Duration::seconds(1),
         valid_until: snapshot.as_of + Duration::seconds(10),
-        source_hash: HashDigest::sha256("quote"),
+        payload_hash: HashDigest::sha256("quote"),
     };
     assert!(
         materialize_order_intent(&snapshot, &release, &evaluated.risk, plan, &predecision).is_err()
     );
 
     let fresh = FreshExecutionQuote {
-        observed_at: snapshot.as_of + Duration::seconds(1),
+        provider_at: snapshot.as_of + Duration::seconds(1),
         ..predecision
     };
-    let intent =
+    let first_intent =
         materialize_order_intent(&snapshot, &release, &evaluated.risk, plan, &fresh).unwrap();
-    assert_eq!(intent.quote_source_hash, fresh.source_hash);
-    assert!(intent.limit_price > fresh.raw_price);
+    let second_intent =
+        materialize_order_intent(&snapshot, &release, &evaluated.risk, plan, &fresh).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&first_intent).unwrap(),
+        serde_json::to_vec(&second_intent).unwrap()
+    );
+    assert_eq!(first_intent.decision_at, snapshot.as_of);
+    assert_eq!(first_intent.arrival_quote, fresh.raw_price);
+    assert_eq!(first_intent.quote_provider_at, fresh.provider_at);
+    assert_eq!(first_intent.quote_received_at, fresh.received_at);
+    assert_eq!(first_intent.quote_payload_hash, fresh.payload_hash);
+    assert_eq!(
+        first_intent.decision_evidence_hash,
+        plan.decision_evidence_hash
+    );
+    assert_ne!(
+        first_intent.materialization_evidence_hash,
+        first_intent.decision_evidence_hash
+    );
+    assert!(first_intent.limit_price > fresh.raw_price);
+}
+
+#[test]
+fn execution_quote_requires_ordered_timestamps_and_at_most_fifteen_seconds() {
+    let release = release();
+    let snapshot = snapshot(&release, "decision-quote-window");
+    let evaluated = evaluate_decision(&snapshot, &release, &limits()).unwrap();
+    let plan = &evaluated.order_plans[0];
+    let provider_at = snapshot.as_of + Duration::seconds(1);
+    let received_at = provider_at + Duration::seconds(1);
+    let valid_quote = FreshExecutionQuote {
+        symbol: plan.symbol.clone(),
+        raw_price: "57".parse().unwrap(),
+        provider_at,
+        received_at,
+        valid_until: received_at + Duration::seconds(15),
+        payload_hash: HashDigest::sha256("quote-window"),
+    };
+
+    assert!(
+        materialize_order_intent(&snapshot, &release, &evaluated.risk, plan, &valid_quote).is_ok()
+    );
+
+    let received_before_provider = FreshExecutionQuote {
+        received_at: provider_at - Duration::seconds(1),
+        valid_until: provider_at + Duration::seconds(1),
+        ..valid_quote.clone()
+    };
+    assert!(materialize_order_intent(
+        &snapshot,
+        &release,
+        &evaluated.risk,
+        plan,
+        &received_before_provider
+    )
+    .is_err());
+
+    let empty_validity = FreshExecutionQuote {
+        valid_until: received_at,
+        ..valid_quote.clone()
+    };
+    assert!(
+        materialize_order_intent(&snapshot, &release, &evaluated.risk, plan, &empty_validity)
+            .is_err()
+    );
+
+    let overlong_validity = FreshExecutionQuote {
+        valid_until: received_at + Duration::seconds(15) + Duration::nanoseconds(1),
+        ..valid_quote
+    };
+    assert!(materialize_order_intent(
+        &snapshot,
+        &release,
+        &evaluated.risk,
+        plan,
+        &overlong_validity
+    )
+    .is_err());
 }
 
 #[test]
