@@ -12,6 +12,7 @@ pub mod domain;
 pub mod error;
 pub mod fixed;
 pub mod market;
+pub mod performance;
 pub mod pipeline;
 pub mod risk;
 pub mod strategy;
@@ -22,4 +23,9 @@ pub use backtest::{
 pub use domain::*;
 pub use error::{CoreError, CoreResult};
 pub use fixed::{Fixed, Money, Price};
+pub use performance::{
+    run_performance_backtest, DatasetManifest, PerformanceBacktestRequest,
+    PerformanceBacktestResult, PerformanceCostModel, ResearchStage, TerminalValuation,
+    MAX_PERFORMANCE_REQUEST_BYTES,
+};
 pub use pipeline::{evaluate_decision, materialize_order_intent, EvaluationResult};

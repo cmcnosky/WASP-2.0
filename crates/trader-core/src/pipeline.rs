@@ -159,6 +159,7 @@ pub fn materialize_order_intent(
         || quote_validity > Duration::seconds(15)
         || quote_total_window <= Duration::zero()
         || quote_total_window > Duration::seconds(15)
+        || quote.received_at >= release.expires_at
         || !quote.raw_price.fixed().is_positive()
     {
         return Err(CoreError::InvalidDomain(

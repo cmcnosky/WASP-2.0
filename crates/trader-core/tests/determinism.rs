@@ -13,7 +13,7 @@ fn release() -> StrategyRelease {
         cadence: RebalanceCadence::Weekly,
     });
     StrategyRelease {
-        release_id: "release-deterministic-1".into(),
+        release_id: "compiled-parity-release".into(),
         code_hash: HashDigest::sha256("code"),
         parameters_hash: HashDigest::of_json(&strategy).unwrap(),
         universe: ["DIA", "IVV", "IWM", "QQQ", "SCHB", "SPY", "VOO", "VTI"]
@@ -21,7 +21,7 @@ fn release() -> StrategyRelease {
             .map(|symbol| Symbol::new(symbol).unwrap())
             .collect(),
         data_hash: HashDigest::sha256("data"),
-        cost_model_hash: HashDigest::sha256("costs"),
+        cost_model_hash: HashDigest::sha256("cost"),
         statistical_certificate_hash: HashDigest::sha256("certificate"),
         strategy,
         valid_from: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
@@ -89,6 +89,47 @@ fn limits() -> RiskLimitSnapshot {
         marketable_limit_band_bps: 10,
         new_positions_enabled: true,
     }
+}
+
+#[test]
+fn cross_language_identifier_golden_vector_is_stable() {
+    let release = release();
+    let snapshot = snapshot(&release, "compiled-parity-decision");
+    let evaluated = evaluate_decision(&snapshot, &release, &limits()).unwrap();
+    let plan = &evaluated.order_plans[0];
+    let quote = FreshExecutionQuote {
+        symbol: plan.symbol.clone(),
+        raw_price: trader_core::Price::from_scaled(plan.decision_reference_price.scaled() - 10_000),
+        provider_at: snapshot.as_of + Duration::seconds(1),
+        received_at: snapshot.as_of + Duration::seconds(2),
+        valid_until: snapshot.as_of + Duration::seconds(12),
+        payload_hash: HashDigest::sha256("fresh-execution-quote"),
+    };
+    let intent =
+        materialize_order_intent(&snapshot, &release, &evaluated.risk, plan, &quote).unwrap();
+
+    assert_eq!(
+        release.release_hash().unwrap().as_hex(),
+        "65a58d7df98da1a8106d3bf3b9bee3c39c87603829a78be798b201ee6ebea4c2"
+    );
+    assert_eq!(
+        HashDigest::of_json(&snapshot).unwrap().as_hex(),
+        "8a8ea28dedff495690766eacf54db07792d4d9bd3407369078aa7cb4054cb4d3"
+    );
+    assert_eq!(
+        plan.decision_evidence_hash.as_hex(),
+        "430913a73659e9f41226246fc969aaa137d4d59f430873d618a3ae2b182cb77d"
+    );
+    assert_eq!(plan.plan_id, "e1c7b23e-67e8-5747-9598-231ea6de3536");
+    assert_eq!(
+        intent.materialization_evidence_hash.as_hex(),
+        "8fb85efb8990d1ad64931f18b1829aa3ab32645ee2966958f15a877e0f9a2251"
+    );
+    assert_eq!(intent.intent_id, "0b355745-88c4-57b3-9d25-e80203f43bc4");
+    assert_eq!(
+        intent.client_order_id,
+        "autotrader-b710a13308a56c398246b7e1"
+    );
 }
 
 #[test]

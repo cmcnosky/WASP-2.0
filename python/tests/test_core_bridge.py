@@ -9,11 +9,14 @@ from alpaca_autotrader_research.core_bridge import (
     CoreProtocolError,
     CoreUnavailableError,
 )
+from alpaca_autotrader_research.hashing import JSON_HASH_PROFILE
 
 
 def fake_core() -> ModuleType:
     module = ModuleType("alpaca_autotrader_core")
     setattr(module, "__version__", "test")
+    setattr(module, "__json_hash_profile__", JSON_HASH_PROFILE)
+    setattr(module, "__performance_request_max_bytes__", 1_000_000)
     setattr(
         module,
         "evaluate_decision",
@@ -25,6 +28,13 @@ def fake_core() -> ModuleType:
         module,
         "backtest",
         lambda request: json.dumps({"request": json.loads(request), "source": "rust"}),
+    )
+    setattr(
+        module,
+        "performance_backtest",
+        lambda request: json.dumps(
+            {"performance_request": json.loads(request), "source": "rust"}
+        ),
     )
     setattr(
         module,
@@ -56,6 +66,15 @@ class CoreBridgeTests(unittest.TestCase):
             with self.assertRaises(CoreUnavailableError):
                 CoreBridge.load()
 
+    def test_delegates_performance_replay_to_compiled_contract(self) -> None:
+        response = CoreBridge(fake_core()).performance_backtest(
+            {"dataset_manifest_hash": "abc", "stage": "synthetic"}
+        )
+        self.assertEqual("rust", response["source"])
+        self.assertEqual(
+            "synthetic", response["performance_request"]["stage"]
+        )
+
     def test_delegates_intent_materialization_to_compiled_contract(self) -> None:
         response = CoreBridge(fake_core()).materialize_order_intent(
             snapshot={"decision_id": "d", "as_of": "2025-01-01T21:00:00Z"},
@@ -78,6 +97,28 @@ class CoreBridgeTests(unittest.TestCase):
         with self.assertRaises(CoreUnavailableError):
             CoreBridge(module)
 
+    def test_core_without_performance_contract_is_incompatible(self) -> None:
+        module = fake_core()
+        delattr(module, "performance_backtest")
+        with self.assertRaises(CoreUnavailableError):
+            CoreBridge(module)
+
+    def test_core_profile_and_request_ceiling_are_required(self) -> None:
+        missing = fake_core()
+        delattr(missing, "__json_hash_profile__")
+        with self.assertRaises(CoreUnavailableError):
+            CoreBridge(missing)
+
+        mismatched = fake_core()
+        setattr(mismatched, "__json_hash_profile__", "wrong-profile")
+        with self.assertRaises(CoreUnavailableError):
+            CoreBridge(mismatched)
+
+        capped = fake_core()
+        setattr(capped, "__performance_request_max_bytes__", 8)
+        with self.assertRaises(CoreInvocationError):
+            CoreBridge(capped).performance_backtest({"request": "too large"})
+
     def test_core_errors_and_invalid_output_fail_closed(self) -> None:
         module = fake_core()
         setattr(
@@ -88,6 +129,9 @@ class CoreBridgeTests(unittest.TestCase):
         with self.assertRaises(CoreInvocationError):
             CoreBridge(module).backtest({"request": 1})
         setattr(module, "backtest", lambda request: "NaN")
+        with self.assertRaises(CoreProtocolError):
+            CoreBridge(module).backtest({"request": 1})
+        setattr(module, "backtest", lambda request: '{"nested":{"a":1,"a":2}}')
         with self.assertRaises(CoreProtocolError):
             CoreBridge(module).backtest({"request": 1})
 

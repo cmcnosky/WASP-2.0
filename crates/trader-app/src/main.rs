@@ -1,11 +1,12 @@
-use std::{fs, path::PathBuf};
+use std::{fs, fs::File, io::Read, path::PathBuf};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use trader_core::{
     backtest::DecisionReplayRequest, evaluate_decision, materialize_order_intent, run_backtest,
-    run_decision_replay, DecisionSnapshot, FreshExecutionQuote, OrderPlan, RiskDecision,
-    RiskLimitSnapshot, StrategyRelease,
+    run_decision_replay, run_performance_backtest, DecisionSnapshot, FreshExecutionQuote,
+    OrderPlan, PerformanceBacktestRequest, RiskDecision, RiskLimitSnapshot, StrategyRelease,
+    MAX_PERFORMANCE_REQUEST_BYTES,
 };
 use trader_execution::config::RuntimeConfig;
 use trader_execution::observer_runtime::run_paper_observer_from_env;
@@ -52,6 +53,11 @@ enum Command {
         #[arg(long)]
         request: PathBuf,
     },
+    /// Replay hash-bound market/execution evidence through the production core.
+    PerformanceBacktest {
+        #[arg(long)]
+        request: PathBuf,
+    },
     /// Materialize one authorized plan using a fresh post-decision raw quote.
     MaterializeIntent {
         #[arg(long)]
@@ -71,6 +77,19 @@ enum Command {
 
 fn read_json<T: serde::de::DeserializeOwned>(path: &PathBuf) -> Result<T> {
     let bytes = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
+}
+
+fn read_json_capped<T: serde::de::DeserializeOwned>(path: &PathBuf, limit: usize) -> Result<T> {
+    let mut file = File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take(u64::try_from(limit)? + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    if bytes.len() > limit {
+        bail!("{} exceeds the serialized byte ceiling", path.display());
+    }
     serde_json::from_slice(&bytes).with_context(|| format!("invalid JSON in {}", path.display()))
 }
 
@@ -120,6 +139,11 @@ async fn main() -> Result<()> {
         Command::DecisionReplay { request } => {
             let request: DecisionReplayRequest = read_json(&request)?;
             print_json(&run_decision_replay(&request)?)
+        }
+        Command::PerformanceBacktest { request } => {
+            let request: PerformanceBacktestRequest =
+                read_json_capped(&request, MAX_PERFORMANCE_REQUEST_BYTES)?;
+            print_json(&run_performance_backtest(&request)?)
         }
         Command::MaterializeIntent {
             snapshot,

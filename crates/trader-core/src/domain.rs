@@ -86,17 +86,55 @@ impl FromStr for Symbol {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct HashDigest([u8; 32]);
 
+pub const JSON_HASH_PROFILE: &str = "wasp-json-sha256-v1";
+
 impl HashDigest {
     pub fn sha256(bytes: impl AsRef<[u8]>) -> Self {
         Self(Sha256::digest(bytes.as_ref()).into())
     }
 
-    pub fn of_json<T: Serialize>(value: &T) -> CoreResult<Self> {
-        Ok(Self::sha256(serde_json::to_vec(value)?))
+    pub fn of_json<T: Serialize + ?Sized>(value: &T) -> CoreResult<Self> {
+        let canonical = canonicalize_json_value(serde_json::to_value(value)?)?;
+        Ok(Self::sha256(serde_json::to_vec(&canonical)?))
     }
 
     pub fn as_hex(&self) -> String {
         hex::encode(self.0)
+    }
+}
+
+fn canonicalize_json_value(value: serde_json::Value) -> CoreResult<serde_json::Value> {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut entries = object.into_iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut canonical = serde_json::Map::new();
+            for (key, value) in entries {
+                canonical.insert(key, canonicalize_json_value(value)?);
+            }
+            Ok(serde_json::Value::Object(canonical))
+        }
+        serde_json::Value::Array(values) => Ok(serde_json::Value::Array(
+            values
+                .into_iter()
+                .map(canonicalize_json_value)
+                .collect::<CoreResult<Vec<_>>>()?,
+        )),
+        serde_json::Value::Number(number) => {
+            let encoded = number.to_string();
+            let is_integer = if encoded.starts_with('-') {
+                encoded.parse::<i128>().is_ok()
+            } else {
+                encoded.parse::<u128>().is_ok()
+            };
+            if !is_integer {
+                return Err(CoreError::Serialization(
+                    "canonical JSON evidence permits only i128/u128 integers".into(),
+                ));
+            }
+            Ok(serde_json::Value::Number(number))
+        }
+        scalar => Ok(scalar),
     }
 }
 
@@ -699,7 +737,81 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod tests {
+    use chrono::{Duration, TimeZone};
+
     use super::{fixtures::*, *};
+
+    #[test]
+    fn json_hash_is_canonical_across_object_field_order() {
+        #[derive(Serialize)]
+        struct ReverseOrder {
+            b: u8,
+            a: u8,
+        }
+
+        let digest = HashDigest::of_json(&ReverseOrder { b: 2, a: 1 }).unwrap();
+        assert_eq!(digest, HashDigest::sha256(br#"{"a":1,"b":2}"#));
+        assert_eq!(
+            digest,
+            HashDigest::of_json(&serde_json::json!({"a": 1, "b": 2})).unwrap()
+        );
+
+        let nested =
+            serde_json::from_str::<serde_json::Value>(r#"{"z":{"z":2,"a":1},"a":[{"z":2,"a":1}]}"#)
+                .unwrap();
+        assert_eq!(
+            HashDigest::of_json(&nested).unwrap(),
+            HashDigest::sha256(br#"{"a":[{"a":1,"z":2}],"z":{"a":1,"z":2}}"#)
+        );
+    }
+
+    #[test]
+    fn json_hash_uses_rfc3339_autosi_timestamp_precision() {
+        #[derive(Serialize)]
+        struct TimestampEvidence {
+            at: DateTime<Utc>,
+        }
+
+        let at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap() + Duration::milliseconds(500);
+        assert_eq!(
+            HashDigest::of_json(&TimestampEvidence { at }).unwrap(),
+            HashDigest::sha256(br#"{"at":"2026-01-01T00:00:00.500Z"}"#)
+        );
+        for (offset, expected) in [
+            (Duration::zero(), "2026-01-01T00:00:00Z"),
+            (Duration::microseconds(500), "2026-01-01T00:00:00.000500Z"),
+            (Duration::nanoseconds(500), "2026-01-01T00:00:00.000000500Z"),
+        ] {
+            let at = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap() + offset;
+            let encoded = format!(r#"{{"at":"{expected}"}}"#);
+            assert_eq!(
+                HashDigest::of_json(&TimestampEvidence { at }).unwrap(),
+                HashDigest::sha256(encoded)
+            );
+        }
+    }
+
+    #[test]
+    fn json_hash_profile_accepts_full_integers_and_rejects_floats() {
+        assert!(HashDigest::of_json(&i128::MIN).is_ok());
+        assert!(HashDigest::of_json(&i128::MAX).is_ok());
+        assert!(HashDigest::of_json(&u128::MAX).is_ok());
+        assert!(HashDigest::of_json(&1.0_f64).is_err());
+
+        let vector = serde_json::from_str::<serde_json::Value>(
+            r#"{"timestamp_zero":"2026-01-01T00:00:00Z","nested":{"z":true,"a":"é"},"integer_min":-170141183460469231731687303715884105728,"timestamp_milli":"2026-01-01T00:00:00.500Z","integer_max":170141183460469231731687303715884105727,"fixed_scaled":-1234567,"array":[3,2,1],"timestamp_micro":"2026-01-01T00:00:00.000500Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            HashDigest::of_json(&vector).unwrap().as_hex(),
+            "0bb9dbc312710da164d2837c9c00edb4067cb6e57df7fafefd19e3f74723f198"
+        );
+        let nanos = serde_json::json!({"at": "2026-01-01T00:00:00.000000500Z"});
+        assert_eq!(
+            HashDigest::of_json(&nanos).unwrap().as_hex(),
+            "65eff45abf65bfee39c26619df34a5a60dbde2dfcdb90e59438f226884a824d8"
+        );
+    }
 
     #[test]
     fn release_binds_embedded_parameters() {
