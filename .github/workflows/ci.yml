@@ -106,6 +106,13 @@ jobs:
           terraform_wrapper: false
       - name: Formatting
         run: terraform -chdir=infra/terraform fmt -check -recursive
+      - name: Verify supported provider lock platforms
+        run: |
+          terraform -chdir=infra/terraform providers lock \
+            -platform=linux_amd64 \
+            -platform=linux_arm64 \
+            -platform=darwin_arm64
+          git diff --exit-code -- infra/terraform/.terraform.lock.hcl
       - name: Initialize without backend
         run: terraform -chdir=infra/terraform init -backend=false -input=false -lockfile=readonly
       - name: Validate
