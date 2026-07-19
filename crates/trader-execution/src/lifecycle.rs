@@ -155,6 +155,23 @@ impl OrderLifecycle {
         if self.seen_payload_hashes.contains(&event.raw_payload_hash) {
             return Ok(());
         }
+        if self.phase == OrderPhase::IntentCommitted {
+            return self.fail_closed("broker event arrived before submission began");
+        }
+        if let (Some(expected), Some(observed)) =
+            (&self.provider_order_id, &event.provider_order_id)
+        {
+            if observed != expected {
+                return self.fail_closed("provider order identity changed within one intent");
+            }
+        }
+        if event.provider_timestamp > event.received_at
+            || self
+                .last_event_at
+                .is_some_and(|last_received| event.received_at < last_received)
+        {
+            return self.fail_closed("broker event timestamps are future or out of receive order");
+        }
         if event.filled_quantity.get() > self.intent.quantity.get()
             || event.filled_quantity.get() < self.filled_quantity.get()
         {
@@ -171,6 +188,17 @@ impl OrderLifecycle {
             ));
         }
         let status = BrokerOrderStatus::from_provider(&event.status);
+        if self.phase == OrderPhase::PartiallyFilled
+            && matches!(
+                status,
+                BrokerOrderStatus::Accepted
+                    | BrokerOrderStatus::New
+                    | BrokerOrderStatus::PendingNew
+                    | BrokerOrderStatus::AcceptedForBidding
+            )
+        {
+            return self.fail_closed("broker order state regressed after a partial fill");
+        }
         self.phase = match status {
             BrokerOrderStatus::Accepted
             | BrokerOrderStatus::New

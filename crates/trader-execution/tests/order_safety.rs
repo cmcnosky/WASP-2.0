@@ -19,12 +19,16 @@ fn intent(client_order_id: &str, quantity: u64) -> OrderIntent {
         side: OrderSide::Buy,
         quantity: WholeQuantity::new(quantity),
         limit_price: "10.05".parse().unwrap(),
-        quote_observed_at: "2026-07-18T13:59:59Z".parse().unwrap(),
-        quote_valid_until: "2026-07-18T14:01:00Z".parse().unwrap(),
-        quote_source_hash: HashDigest::sha256("quote"),
+        decision_at: "2026-07-18T13:59:58Z".parse().unwrap(),
+        arrival_quote: "10".parse().unwrap(),
+        quote_provider_at: "2026-07-18T13:59:59Z".parse().unwrap(),
+        quote_received_at: "2026-07-18T13:59:59Z".parse().unwrap(),
+        quote_valid_until: "2026-07-18T14:00:10Z".parse().unwrap(),
+        quote_payload_hash: HashDigest::sha256("quote"),
         time_in_force: TimeInForce::Day,
         decision_evidence_hash: HashDigest::sha256("decision"),
-        created_at: "2026-07-18T14:00:00Z".parse().unwrap(),
+        materialization_evidence_hash: HashDigest::sha256("materialization"),
+        created_at: "2026-07-18T13:59:59Z".parse().unwrap(),
     }
 }
 
@@ -57,6 +61,7 @@ fn checked_in_lifecycle_fixture_reaches_fill_without_quantity_drift() {
     let fixture = include_str!("../../../fixtures/alpaca/order_lifecycle.jsonl");
     let lines: Vec<_> = fixture.lines().collect();
     let mut lifecycle = OrderLifecycle::committed(intent("v1-paper-release-decision-001", 10));
+    lifecycle.begin_submission().unwrap();
     for line in &lines[..4] {
         lifecycle
             .apply_broker_event(&event_from_fixture(line))
@@ -76,6 +81,7 @@ fn checked_in_future_status_fails_closed() {
     let last = fixture.lines().last().unwrap();
     let event = event_from_fixture(last);
     let mut lifecycle = OrderLifecycle::committed(intent(&event.client_order_id, 1));
+    lifecycle.begin_submission().unwrap();
     assert!(lifecycle.apply_broker_event(&event).is_err());
     assert!(matches!(
         lifecycle.phase,
@@ -90,6 +96,7 @@ fn fill_without_positive_price_fails_closed() {
     let mut event = event_from_fixture(fixture.lines().nth(2).unwrap());
     event.fill_price = None;
     let mut lifecycle = OrderLifecycle::committed(intent(&event.client_order_id, 10));
+    lifecycle.begin_submission().unwrap();
     assert!(lifecycle.apply_broker_event(&event).is_err());
     assert!(matches!(
         lifecycle.phase,
@@ -177,4 +184,32 @@ fn outbox_completion_cannot_be_written_twice() {
     assert!(ledger
         .mark_outbox_completed(sequence, "owner", 7, at)
         .is_err());
+}
+
+#[test]
+fn provider_identity_and_event_order_cannot_drift() {
+    let fixture = include_str!("../../../fixtures/alpaca/order_lifecycle.jsonl");
+    let first = event_from_fixture(fixture.lines().next().unwrap());
+    let mut lifecycle = OrderLifecycle::committed(intent(&first.client_order_id, 10));
+    lifecycle.begin_submission().unwrap();
+    lifecycle.apply_broker_event(&first).unwrap();
+
+    let mut changed_identity = event_from_fixture(fixture.lines().nth(1).unwrap());
+    changed_identity.provider_order_id = Some("different-provider-order".into());
+    assert!(lifecycle.apply_broker_event(&changed_identity).is_err());
+    assert!(matches!(
+        lifecycle.phase,
+        OrderPhase::FailClosedUnknown { .. }
+    ));
+
+    let mut lifecycle = OrderLifecycle::committed(intent(&first.client_order_id, 10));
+    lifecycle.begin_submission().unwrap();
+    lifecycle.apply_broker_event(&first).unwrap();
+    let mut out_of_order = event_from_fixture(fixture.lines().nth(1).unwrap());
+    out_of_order.received_at = first.received_at - chrono::Duration::milliseconds(1);
+    assert!(lifecycle.apply_broker_event(&out_of_order).is_err());
+    assert!(matches!(
+        lifecycle.phase,
+        OrderPhase::FailClosedUnknown { .. }
+    ));
 }
