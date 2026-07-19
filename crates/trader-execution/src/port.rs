@@ -142,7 +142,7 @@ impl RegularTradingSessionPermit {
 
 /// A 204 response only acknowledges that Alpaca accepted the cancellation
 /// request. It is never evidence that the order reached terminal `canceled`.
-#[derive(Clone, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CancellationRequestAccepted {
     pub provider_order_id: String,
     pub accepted_at: DateTime<Utc>,
@@ -150,9 +150,24 @@ pub struct CancellationRequestAccepted {
     pub raw_payload_hash: HashDigest,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+/// Local transport evidence proving that no broker I/O began. This outcome may
+/// become retryable only after it is durably appended to the cancellation
+/// state machine; an in-memory value alone never authorizes another DELETE.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CancellationNotDispatched {
+    pub provider_order_id: String,
+    pub observed_at: DateTime<Utc>,
+    pub reason_code: String,
+    pub detail: String,
+    pub evidence_hash: HashDigest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CancellationOutcome {
     RequestAccepted(CancellationRequestAccepted),
+    /// The transport proved that it rejected the request before any I/O. The
+    /// coordinator must durably record this exact attempt before retrying.
+    NotDispatched(CancellationNotDispatched),
     /// Dispatch may have occurred but no trustworthy acknowledgement exists.
     /// Callers must reconcile by reading broker order state and must not infer
     /// a terminal lifecycle transition from this result.
@@ -177,6 +192,14 @@ pub trait BrokerPort: Send + Sync {
     async fn find_order_by_client_id(
         &self,
         expected_intent: &OrderIntent,
+    ) -> Result<Option<BrokerEvent>, ExecutionError>;
+    /// Reconciliation-only lookup for a cancellation whose DELETE may already
+    /// have reached the broker. Implementations must validate both provider and
+    /// client identities and must never turn this read into another DELETE.
+    async fn find_order_by_provider_id(
+        &self,
+        provider_order_id: &str,
+        expected_client_order_id: &str,
     ) -> Result<Option<BrokerEvent>, ExecutionError>;
     async fn submit_committed_intent(
         &self,
