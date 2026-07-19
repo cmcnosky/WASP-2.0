@@ -28,7 +28,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use trader_core::{
     AccountSnapshot, BrokerEvent, Environment, Fixed, FreshExecutionQuote, HashDigest, Money,
@@ -38,8 +38,8 @@ use trader_core::{
 use crate::{
     config::{MARKET_DATA_API, PAPER_TRADING_API},
     port::{
-        BrokerPort, CancellationOutcome, CancellationRequestAccepted, RegularTradingSessionPermit,
-        SubmissionOutcome,
+        BrokerPort, CancellationNotDispatched, CancellationOutcome, CancellationRequestAccepted,
+        RegularTradingSessionPermit, SubmissionOutcome,
     },
     rate_limit::RequestClass,
     ExecutionError,
@@ -1069,30 +1069,104 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
         })
     }
 
-    pub async fn cancel_order(
+    /// Read-only recovery lookup for a cancellation whose DELETE may already
+    /// have reached Alpaca. The provider order ID is both the request key and a
+    /// response invariant; a mismatch fails closed.
+    pub async fn get_order_by_provider_order_id(
         &self,
         provider_order_id: &str,
-    ) -> Result<CancellationOutcome, ExecutionError> {
+    ) -> Result<Observed<Option<AlpacaOrder>>, ExecutionError> {
         validate_bounded_text("provider_order_id", provider_order_id, MAX_IDENTIFIER_BYTES)?;
         let url = format!(
             "{PAPER_TRADING_API}/v2/orders/{}",
             percent_encode_component(provider_order_id)
         );
-        let response = match self
+        let response = self
             .send(
-                HttpMethod::Delete,
-                RequestClass::Cancel,
+                HttpMethod::Get,
+                RequestClass::Reconciliation,
                 None,
                 url,
                 Vec::new(),
             )
-            .await
-        {
+            .await?;
+        let evidence = evidence(&response)?;
+        if response.status == 404 {
+            return Ok(Observed {
+                value: None,
+                evidence,
+            });
+        }
+        require_status("get order by provider_order_id", &response, 200)?;
+        let raw: RawOrder = parse_json("provider order lookup", &response.body)?;
+        let order: AlpacaOrder = raw.try_into()?;
+        if order.provider_order_id != provider_order_id {
+            return Err(ExecutionError::Broker(
+                "provider order lookup returned a different provider_order_id".into(),
+            ));
+        }
+        Ok(Observed {
+            value: Some(order),
+            evidence,
+        })
+    }
+
+    pub async fn cancel_order(
+        &self,
+        provider_order_id: &str,
+    ) -> Result<CancellationOutcome, ExecutionError> {
+        validate_bounded_text("provider_order_id", provider_order_id, MAX_IDENTIFIER_BYTES)?;
+        self.ensure_paper()?;
+        let url = format!(
+            "{PAPER_TRADING_API}/v2/orders/{}",
+            percent_encode_component(provider_order_id)
+        );
+        let request = HttpRequest {
+            method: HttpMethod::Delete,
+            request_class: RequestClass::Cancel,
+            not_after: None,
+            url,
+            headers: BTreeMap::from([("Accept".into(), "application/json".into())]),
+            body: Vec::new(),
+        };
+        let response = match self.transport.send(request).await {
             Ok(response) => response,
-            Err(ExecutionError::SubmissionUnknown(detail)) => {
-                return Ok(CancellationOutcome::Unknown { detail });
+            Err(TransportError::BeforeSend { detail }) => {
+                let observed_at = postgres_microsecond_timestamp(Utc::now());
+                let detail = bounded_message(&detail);
+                let reason_code = "TRANSPORT_BEFORE_SEND".to_owned();
+                let evidence_hash = HashDigest::of_json(&serde_json::json!({
+                    "provider_order_id": provider_order_id,
+                    "observed_at": observed_at,
+                    "reason_code": &reason_code,
+                    "detail": &detail,
+                }))?;
+                return Ok(CancellationOutcome::NotDispatched(
+                    CancellationNotDispatched {
+                        provider_order_id: provider_order_id.into(),
+                        observed_at,
+                        reason_code,
+                        detail,
+                        evidence_hash,
+                    },
+                ));
             }
-            Err(error) => return Err(error),
+            Err(TransportError::Timeout { detail }) => {
+                return Ok(CancellationOutcome::Unknown {
+                    detail: format!(
+                        "broker mutation timed out; reconcile by stable identity: {}",
+                        bounded_message(&detail)
+                    ),
+                });
+            }
+            Err(TransportError::ConnectionLost { detail }) => {
+                return Ok(CancellationOutcome::Unknown {
+                    detail: format!(
+                        "broker mutation connection lost; reconcile by stable identity: {}",
+                        bounded_message(&detail)
+                    ),
+                });
+            }
         };
         if response.status != 204 {
             return Ok(CancellationOutcome::Unknown {
@@ -1225,6 +1299,30 @@ impl<T: HttpTransport> BrokerPort for AlpacaPaperAdapter<T> {
                 Ok(order.to_broker_event(&observed.evidence))
             })
             .transpose()
+    }
+
+    async fn find_order_by_provider_id(
+        &self,
+        provider_order_id: &str,
+        expected_client_order_id: &str,
+    ) -> Result<Option<BrokerEvent>, ExecutionError> {
+        validate_bounded_text(
+            "expected_client_order_id",
+            expected_client_order_id,
+            MAX_IDENTIFIER_BYTES,
+        )?;
+        let observed = self
+            .get_order_by_provider_order_id(provider_order_id)
+            .await?;
+        let Some(order) = observed.value else {
+            return Ok(None);
+        };
+        if order.client_order_id != expected_client_order_id {
+            return Err(ExecutionError::Broker(
+                "provider order lookup returned a different client_order_id".into(),
+            ));
+        }
+        Ok(Some(order.to_broker_event(&observed.evidence)))
     }
 
     async fn submit_committed_intent(
@@ -2049,6 +2147,12 @@ fn bounded_message(value: &str) -> String {
         .collect()
 }
 
+fn postgres_microsecond_timestamp(value: DateTime<Utc>) -> DateTime<Utc> {
+    value
+        .with_nanosecond((value.nanosecond() / 1_000) * 1_000)
+        .expect("a truncated nanosecond value is always valid")
+}
+
 fn validate_bounded_text(field: &str, value: &str, max_bytes: usize) -> Result<(), ExecutionError> {
     if value.is_empty() || value.len() > max_bytes || value.chars().any(char::is_control) {
         return Err(ExecutionError::UnsafeConfiguration(format!(
@@ -2100,6 +2204,7 @@ mod tests {
     struct FakeState {
         outcomes: VecDeque<Result<HttpResponse, TransportError>>,
         requests: Vec<HttpRequest>,
+        io_attempts: u32,
     }
 
     impl FakeTransport {
@@ -2108,12 +2213,17 @@ mod tests {
                 state: Arc::new(Mutex::new(FakeState {
                     outcomes: outcomes.into(),
                     requests: Vec::new(),
+                    io_attempts: 0,
                 })),
             }
         }
 
         fn requests(&self) -> Vec<HttpRequest> {
             self.state.lock().unwrap().requests.clone()
+        }
+
+        fn io_attempts(&self) -> u32 {
+            self.state.lock().unwrap().io_attempts
         }
     }
 
@@ -2136,7 +2246,11 @@ mod tests {
         async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
             let mut state = self.state.lock().unwrap();
             state.requests.push(request);
-            state.outcomes.pop_front().expect("planned response")
+            let outcome = state.outcomes.pop_front().expect("planned response");
+            if !matches!(outcome, Err(TransportError::BeforeSend { .. })) {
+                state.io_attempts += 1;
+            }
+            outcome
         }
     }
 
@@ -2989,6 +3103,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_id_recovery_is_read_only_and_validates_both_identities() {
+        let transport =
+            FakeTransport::with_outcomes(vec![Ok(response(200, order_json("pending_cancel")))]);
+        let paper_adapter = adapter(transport.clone());
+        let event = BrokerPort::find_order_by_provider_id(&paper_adapter, "order-1", "client-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.provider_order_id.as_deref(), Some("order-1"));
+        assert_eq!(event.client_order_id, "client-1");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].method, HttpMethod::Get);
+        assert_eq!(
+            requests[0].url,
+            "https://paper-api.alpaca.markets/v2/orders/order-1"
+        );
+
+        let mut wrong_client = order_json("pending_cancel");
+        wrong_client["client_order_id"] = json!("other-client");
+        let wrong_client_adapter = adapter(FakeTransport::with_outcomes(vec![Ok(response(
+            200,
+            wrong_client,
+        ))]));
+        assert!(BrokerPort::find_order_by_provider_id(
+            &wrong_client_adapter,
+            "order-1",
+            "client-1"
+        )
+        .await
+        .is_err());
+
+        let mut wrong_provider = order_json("pending_cancel");
+        wrong_provider["id"] = json!("other-order");
+        let wrong_provider_adapter = adapter(FakeTransport::with_outcomes(vec![Ok(response(
+            200,
+            wrong_provider,
+        ))]));
+        assert!(wrong_provider_adapter
+            .get_order_by_provider_order_id("order-1")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn broker_port_recovery_rejects_same_client_id_with_different_order_contract() {
         let mut mismatched = order_json("accepted");
         mismatched["symbol"] = json!("QQQ");
@@ -3021,6 +3180,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_before_send_is_distinct_and_proves_zero_transport_io() {
+        let transport = FakeTransport::with_outcomes(vec![Err(TransportError::BeforeSend {
+            detail: "HTTP request budget denied dispatch".into(),
+        })]);
+        let outcome = adapter(transport.clone())
+            .cancel_order("order-1")
+            .await
+            .unwrap();
+        let CancellationOutcome::NotDispatched(proof) = outcome else {
+            panic!("expected a provable not-dispatched outcome")
+        };
+        assert_eq!(proof.provider_order_id, "order-1");
+        assert_eq!(proof.reason_code, "TRANSPORT_BEFORE_SEND");
+        assert!(proof.detail.contains("request budget denied"));
+        assert_eq!(transport.requests().len(), 1);
+        assert_eq!(transport.io_attempts(), 0);
+        assert_eq!(
+            proof.evidence_hash,
+            HashDigest::of_json(&json!({
+                "provider_order_id": proof.provider_order_id,
+                "observed_at": proof.observed_at,
+                "reason_code": proof.reason_code,
+                "detail": proof.detail,
+            }))
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn cancel_204_without_sanitized_request_id_is_unknown_not_terminal_canceled() {
         for headers in [
             BTreeMap::new(),
@@ -3045,6 +3233,7 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, CancellationOutcome::Unknown { .. }));
         assert_eq!(transport.requests().len(), 1);
+        assert_eq!(transport.io_attempts(), 1);
     }
 
     #[tokio::test]

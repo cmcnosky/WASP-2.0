@@ -624,6 +624,35 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn exhausted_cancel_budget_fails_before_any_network_dispatch() {
+        let mut transport = test_transport();
+        transport.request_budget = Arc::new(Mutex::new(
+            RequestBudget::new_after_restart(
+                REQUEST_LIMIT_PER_MINUTE,
+                REQUEST_SAFETY_RESERVE,
+                Instant::now(),
+            )
+            .expect("restart-seeded test budget should be valid"),
+        ));
+        let mut cancel = request("https://paper-api.alpaca.markets/v2/orders/order-1");
+        cancel.method = HttpMethod::Delete;
+        cancel.request_class = RequestClass::Cancel;
+
+        let result = transport.send(cancel).await;
+
+        assert!(matches!(
+            result,
+            Err(TransportError::BeforeSend { detail })
+                if detail == "HTTP request budget denied dispatch"
+        ));
+        assert_eq!(
+            lock_budget(&transport.request_budget).unwrap().in_window(),
+            usize::from(REQUEST_LIMIT_PER_MINUTE),
+            "a denied dispatch must not consume another request slot"
+        );
+    }
+
     #[test]
     fn injected_auth_headers_are_sensitive() {
         let transport = test_transport();

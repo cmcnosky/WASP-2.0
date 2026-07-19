@@ -8,7 +8,7 @@
 use std::{collections::BTreeMap, str::FromStr, time::Duration};
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde_json::{json, Value};
 use thiserror::Error;
 use tokio_postgres::{Client, IsolationLevel, Row, Transaction};
@@ -19,6 +19,8 @@ use trader_core::{
     RiskDecision, RiskDisposition, StrategyRelease, TargetPortfolio, TimeInForce, WholeQuantity,
 };
 use uuid::Uuid;
+
+use crate::port::{CancellationNotDispatched, CancellationRequestAccepted};
 
 const MAX_LEASE_TTL: Duration = Duration::from_secs(60);
 
@@ -64,7 +66,7 @@ WHERE renewed.renewed
 const ASSERT_CURRENT_LEASE_SQL: &str =
     "SELECT public.assert_current_executor_lease($1, $2, $3, $4) AS current";
 const CLAIM_FIRST_DISPATCH_SQL: &str =
-    "SELECT * FROM public.claim_order_outbox_v2($1, $2, $3, $4, $5)";
+    "SELECT * FROM public.claim_order_outbox_v3($1, $2, $3, $4, $5)";
 const CLAIM_RECOVERY_SQL: &str =
     "SELECT * FROM public.claim_order_outbox_recovery_v2($1, $2, $3, $4, $5)";
 const CLAIM_COMPLETION_SQL: &str =
@@ -78,6 +80,40 @@ SELECT public.append_submission_unknown_v2(
 "#;
 const LIST_UNRESOLVED_OUTBOXES_SQL: &str = r#"
 SELECT * FROM public.list_unresolved_order_outboxes_v2($1, $2, $3, $4, $5)
+"#;
+const PERSIST_CANCEL_INTENT_SQL: &str = r#"
+SELECT public.persist_cancel_intent_v2(
+    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13
+) AS persisted
+"#;
+const CLAIM_CANCEL_DISPATCH_SQL: &str =
+    "SELECT * FROM public.claim_cancel_outbox_v2($1, $2, $3, $4, $5)";
+const CLAIM_CANCEL_RETRY_SQL: &str =
+    "SELECT * FROM public.claim_cancel_outbox_retry_v2($1, $2, $3, $4, $5)";
+const CLAIM_CANCEL_RECOVERY_SQL: &str =
+    "SELECT * FROM public.claim_cancel_outbox_recovery_v2($1, $2, $3, $4, $5)";
+const CLAIM_CANCEL_COMPLETION_SQL: &str =
+    "SELECT * FROM public.claim_cancel_outbox_completion_v2($1, $2, $3, $4, $5)";
+const APPEND_CANCEL_ACCEPTED_SQL: &str = r#"
+SELECT public.append_cancel_request_accepted_v2(
+    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10
+) AS appended
+"#;
+const APPEND_CANCEL_UNKNOWN_SQL: &str = r#"
+SELECT public.append_cancel_unknown_v2($1,$2,$3,$4,$5,$6,$7,$8) AS appended
+"#;
+const APPEND_CANCEL_NOT_DISPATCHED_SQL: &str = r#"
+SELECT public.append_cancel_not_dispatched_v2(
+    $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12
+) AS appended
+"#;
+const FINALIZE_CANCEL_OUTBOX_SQL: &str = r#"
+SELECT public.finalize_cancel_outbox_v2(
+    $1,$2,$3,$4,$5,$6,$7,$8
+) AS finalized
+"#;
+const LIST_UNRESOLVED_CANCELS_SQL: &str = r#"
+SELECT * FROM public.list_unresolved_cancel_outboxes_v2($1, $2, $3, $4, $5)
 "#;
 
 const SCHEMA_COLUMNS_SQL: &str = r#"
@@ -99,6 +135,7 @@ WITH required_function(signature) AS (
         ('public.renew_executor_lease(text,text,uuid,bigint,interval)'),
         ('public.assert_current_executor_lease(text,text,uuid,bigint)'),
         ('public.claim_order_outbox_v2(text,text,uuid,uuid,bigint)'),
+        ('public.claim_order_outbox_v3(text,text,uuid,uuid,bigint)'),
         ('public.claim_order_outbox_recovery_v2(text,text,uuid,uuid,bigint)'),
         ('public.claim_order_outbox_completion_v2(text,text,uuid,uuid,bigint)'),
         ('public.append_submission_unknown_v2(text,text,uuid,uuid,bigint,uuid,text,jsonb,timestamp with time zone)'),
@@ -120,6 +157,20 @@ WITH required_function(signature) AS (
         ('public.insert_reconciliation_diff_v2(text,text,uuid,bigint,uuid,uuid,text,text,text)'),
         ('public.finalize_reconciliation_v2(text,text,uuid,bigint,uuid,timestamp with time zone,text,boolean,uuid,text)'),
         ('public.record_runtime_kill_event_v2(text,text,uuid,bigint,uuid,text,text,jsonb,text,timestamp with time zone)'),
+        ('public.persist_cancel_intent_v2(text,text,uuid,bigint,uuid,uuid,uuid,uuid,text,text,text,timestamp with time zone,jsonb)'),
+        ('public.claim_cancel_outbox_v2(text,text,uuid,uuid,bigint)'),
+        ('public.claim_cancel_outbox_retry_v2(text,text,uuid,uuid,bigint)'),
+        ('public.claim_cancel_outbox_recovery_v2(text,text,uuid,uuid,bigint)'),
+        ('public.claim_cancel_outbox_completion_v2(text,text,uuid,uuid,bigint)'),
+        ('public.append_cancel_request_accepted_v2(text,text,uuid,uuid,bigint,uuid,text,text,text,timestamp with time zone)'),
+        ('public.append_cancel_unknown_v2(text,text,uuid,uuid,bigint,uuid,text,timestamp with time zone)'),
+        ('public.append_cancel_not_dispatched_v2(text,text,uuid,uuid,bigint,uuid,text,integer,text,text,text,timestamp with time zone)'),
+        ('public.finalize_cancel_outbox_v2(text,text,uuid,uuid,bigint,uuid,uuid,text)'),
+        ('public.list_unresolved_cancel_outboxes_v2(text,text,uuid,bigint,integer)'),
+        ('public.enforce_cancel_intent_chain()'),
+        ('public.enforce_cancel_state_transition()'),
+        ('public.enforce_cancel_outbox_chain()'),
+        ('public.protect_cancel_outbox()'),
         ('public.enforce_intent_state_transition()'),
         ('public.enforce_order_outbox_chain()'),
         ('public.enforce_broker_event_chain()'),
@@ -134,6 +185,11 @@ WITH required_function(signature) AS (
         ('public.enforce_broker_order_chain()'),
         ('public.prevent_late_reconciliation_diff()'),
         ('public.reject_audit_mutation()')
+), required_view(identity) AS (
+    VALUES
+        ('public.execution_readiness'),
+        ('public.current_cancel_states'),
+        ('public.execution_readiness_v2')
 ), critical_table(table_name) AS (
     VALUES
         ('decision_snapshots'), ('target_portfolios'), ('target_positions'),
@@ -141,7 +197,8 @@ WITH required_function(signature) AS (
         ('intent_state_events'), ('order_outbox'), ('broker_orders'),
         ('broker_order_events'), ('fills'), ('account_snapshots'),
         ('reconciliation_runs'), ('reconciliation_diffs'),
-        ('runtime_schema_attestations')
+        ('runtime_schema_attestations'), ('cancel_intents'),
+        ('cancel_state_events'), ('cancel_outbox')
 ), observed(object_kind, object_identity, definition_sha256, safe) AS (
     SELECT
         'function', required.signature,
@@ -158,13 +215,13 @@ WITH required_function(signature) AS (
     LEFT JOIN pg_proc AS procedure ON procedure.oid = to_regprocedure(required.signature)
     UNION ALL
     SELECT
-        'view', 'public.execution_readiness',
+        'view', required.identity,
         CASE WHEN relation.oid IS NULL THEN NULL ELSE
             encode(sha256(convert_to(pg_get_viewdef(relation.oid, true), 'UTF8')), 'hex')
         END,
         COALESCE(relation.relkind = 'v', FALSE)
-    FROM (SELECT to_regclass('public.execution_readiness') AS oid) AS expected
-    LEFT JOIN pg_class AS relation ON relation.oid = expected.oid
+    FROM required_view AS required
+    LEFT JOIN pg_class AS relation ON relation.oid = to_regclass(required.identity)
     UNION ALL
     SELECT
         'trigger', namespace.nspname || '.' || relation.relname || '.' || trigger.tgname,
@@ -209,7 +266,7 @@ WITH allowed_function(signature) AS (
         ('public.acquire_executor_lease(text,text,uuid,interval)'),
         ('public.renew_executor_lease(text,text,uuid,bigint,interval)'),
         ('public.assert_current_executor_lease(text,text,uuid,bigint)'),
-        ('public.claim_order_outbox_v2(text,text,uuid,uuid,bigint)'),
+        ('public.claim_order_outbox_v3(text,text,uuid,uuid,bigint)'),
         ('public.claim_order_outbox_recovery_v2(text,text,uuid,uuid,bigint)'),
         ('public.claim_order_outbox_completion_v2(text,text,uuid,uuid,bigint)'),
         ('public.append_submission_unknown_v2(text,text,uuid,uuid,bigint,uuid,text,jsonb,timestamp with time zone)'),
@@ -230,7 +287,17 @@ WITH allowed_function(signature) AS (
         ('public.insert_reconciliation_run_v2(text,text,uuid,bigint,uuid,text,uuid,timestamp with time zone)'),
         ('public.insert_reconciliation_diff_v2(text,text,uuid,bigint,uuid,uuid,text,text,text)'),
         ('public.finalize_reconciliation_v2(text,text,uuid,bigint,uuid,timestamp with time zone,text,boolean,uuid,text)'),
-        ('public.record_runtime_kill_event_v2(text,text,uuid,bigint,uuid,text,text,jsonb,text,timestamp with time zone)')
+        ('public.record_runtime_kill_event_v2(text,text,uuid,bigint,uuid,text,text,jsonb,text,timestamp with time zone)'),
+        ('public.persist_cancel_intent_v2(text,text,uuid,bigint,uuid,uuid,uuid,uuid,text,text,text,timestamp with time zone,jsonb)'),
+        ('public.claim_cancel_outbox_v2(text,text,uuid,uuid,bigint)'),
+        ('public.claim_cancel_outbox_retry_v2(text,text,uuid,uuid,bigint)'),
+        ('public.claim_cancel_outbox_recovery_v2(text,text,uuid,uuid,bigint)'),
+        ('public.claim_cancel_outbox_completion_v2(text,text,uuid,uuid,bigint)'),
+        ('public.append_cancel_request_accepted_v2(text,text,uuid,uuid,bigint,uuid,text,text,text,timestamp with time zone)'),
+        ('public.append_cancel_unknown_v2(text,text,uuid,uuid,bigint,uuid,text,timestamp with time zone)'),
+        ('public.append_cancel_not_dispatched_v2(text,text,uuid,uuid,bigint,uuid,text,integer,text,text,text,timestamp with time zone)'),
+        ('public.finalize_cancel_outbox_v2(text,text,uuid,uuid,bigint,uuid,uuid,text)'),
+        ('public.list_unresolved_cancel_outboxes_v2(text,text,uuid,bigint,integer)')
 ), checks(object_name, present) AS (
     SELECT
         'role:current-login',
@@ -420,6 +487,33 @@ pub enum CommitRecoveryKey {
         outbox_id: Uuid,
         completion_reason: String,
     },
+    CancelIntent {
+        cancel_intent_id: Uuid,
+        cancel_outbox_id: Uuid,
+        evidence_hash: HashDigest,
+    },
+    CancelRequestAccepted {
+        cancel_outbox_id: Uuid,
+        state_event_id: Uuid,
+        evidence_hash: HashDigest,
+    },
+    CancelUnknown {
+        cancel_outbox_id: Uuid,
+        state_event_id: Uuid,
+        evidence_hash: HashDigest,
+    },
+    CancelNotDispatched {
+        cancel_outbox_id: Uuid,
+        state_event_id: Uuid,
+        attempt_count: u32,
+        evidence_hash: HashDigest,
+    },
+    CancelFinalization {
+        cancel_outbox_id: Uuid,
+        terminal_state_event_id: Uuid,
+        terminal_broker_event_id: Uuid,
+        completion_reason: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -567,6 +661,36 @@ impl PgExecutionStore {
             .await
             .map_err(|error| StoreError::database(operation, error))?;
         row.map(|row| decode_claimed_outbox(&row, kind, lease))
+            .transpose()
+    }
+
+    async fn claim_cancel(
+        &self,
+        sql: &'static str,
+        operation: &'static str,
+        kind: CancelOutboxClaimKind,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+    ) -> Result<Option<ClaimedCancelOutbox>, StoreError> {
+        self.validate_lease_domain(lease)?;
+        let token = positive_i64(lease.fencing_token, "cancel claim fencing_token")?;
+        let environment = environment_sql(lease.environment);
+        let account = lease.account_fingerprint.as_hex();
+        let row = self
+            .client
+            .query_opt(
+                sql,
+                &[
+                    &environment,
+                    &account,
+                    &cancel_outbox_id,
+                    &lease.owner_id,
+                    &token,
+                ],
+            )
+            .await
+            .map_err(|error| StoreError::database(operation, error))?;
+        row.map(|row| decode_claimed_cancel_outbox(&row, kind, lease))
             .transpose()
     }
 
@@ -738,6 +862,86 @@ pub struct UnresolvedOutbox {
     pub current_state: String,
 }
 
+/// Immutable request to durably authorize one broker cancellation attempt.
+/// The store derives every identifier and the outbox payload deterministically;
+/// callers cannot inject a second transport command for the same broker order.
+#[derive(Clone, Debug)]
+pub struct CancelIntentWrite<'a> {
+    pub client_order_id: &'a str,
+    pub provider_order_id: &'a str,
+    pub reason_code: &'a str,
+    pub requested_at: DateTime<Utc>,
+    pub lease: &'a FencedLease,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PersistedCancelIntent {
+    pub cancel_intent_id: Uuid,
+    pub cancel_outbox_id: Uuid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CancelOutboxClaimKind {
+    FirstDispatch,
+    RetryDispatch,
+    RecoveryLookupOnly,
+    TerminalCompletionOnly,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimedCancelOutbox {
+    pub kind: CancelOutboxClaimKind,
+    pub cancel_outbox_id: Uuid,
+    pub cancel_intent_id: Uuid,
+    pub client_order_id: String,
+    pub provider_order_id: String,
+    pub reason_code: String,
+    pub requested_at: DateTime<Utc>,
+    pub environment: Environment,
+    pub account_fingerprint: HashDigest,
+    pub created_fencing_token: u64,
+    pub claim_fencing_token: u64,
+    pub payload: Value,
+    pub available_at: DateTime<Utc>,
+    pub claimed_by: Uuid,
+    pub claimed_at: DateTime<Utc>,
+    pub attempt_count: u32,
+    pub current_state: String,
+}
+
+/// Exact current broker truth already committed to the execution ledger.  A
+/// restarted coordinator may use this evidence only with the completion-only
+/// cancel claim; it never authorizes another broker mutation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersistedTerminalBrokerEvent {
+    pub broker_event_id: Uuid,
+    pub event: BrokerEvent,
+}
+
+/// Restart/reconciliation projection.  Accepted and unknown outcomes remain
+/// visible here until exact terminal broker truth completes the outbox.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnresolvedCancelOutbox {
+    pub cancel_outbox_id: Uuid,
+    pub cancel_intent_id: Uuid,
+    pub client_order_id: String,
+    pub provider_order_id: String,
+    pub reason_code: String,
+    pub requested_at: DateTime<Utc>,
+    pub created_fencing_token: u64,
+    pub payload: Value,
+    pub available_at: DateTime<Utc>,
+    pub current_state: String,
+    pub request_id: Option<String>,
+    pub payload_hash: Option<HashDigest>,
+    pub detail: String,
+    pub broker_event_id: Option<Uuid>,
+    pub state_occurred_at: DateTime<Utc>,
+    pub current_dispatch_attempt_count: Option<u32>,
+    pub not_dispatched_evidence: Option<CancellationNotDispatched>,
+    pub terminal_broker_evidence: Option<PersistedTerminalBrokerEvent>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PersistedReconciliation {
     pub reconciliation_id: Uuid,
@@ -803,6 +1007,72 @@ pub trait ExecutionStore: Send {
         lease: &FencedLease,
         completion_reason: &str,
     ) -> Result<bool, StoreError>;
+
+    async fn persist_cancel_intent(
+        &mut self,
+        write: &CancelIntentWrite<'_>,
+    ) -> Result<PersistedCancelIntent, StoreError>;
+
+    async fn claim_cancel_dispatch(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+    ) -> Result<Option<ClaimedCancelOutbox>, StoreError>;
+
+    async fn claim_cancel_retry(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+    ) -> Result<Option<ClaimedCancelOutbox>, StoreError>;
+
+    async fn claim_cancel_recovery(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+    ) -> Result<Option<ClaimedCancelOutbox>, StoreError>;
+
+    async fn claim_cancel_terminal_completion(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+    ) -> Result<Option<ClaimedCancelOutbox>, StoreError>;
+
+    async fn record_cancel_request_accepted(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+        accepted: &CancellationRequestAccepted,
+    ) -> Result<bool, StoreError>;
+
+    async fn record_cancel_unknown(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+        detail: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<bool, StoreError>;
+
+    async fn record_cancel_not_dispatched(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+        expected_attempt_count: u32,
+        evidence: &CancellationNotDispatched,
+    ) -> Result<bool, StoreError>;
+
+    async fn finalize_cancel_outbox(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+        terminal_broker_event_id: Uuid,
+        completion_reason: &str,
+    ) -> Result<bool, StoreError>;
+
+    async fn discover_unresolved_cancels(
+        &mut self,
+        lease: &FencedLease,
+        limit: u16,
+    ) -> Result<Vec<UnresolvedCancelOutbox>, StoreError>;
 
     async fn record_broker_event(
         &mut self,
@@ -1106,6 +1376,496 @@ impl ExecutionStore for PgExecutionStore {
             });
         }
         Ok(true)
+    }
+
+    async fn persist_cancel_intent(
+        &mut self,
+        write: &CancelIntentWrite<'_>,
+    ) -> Result<PersistedCancelIntent, StoreError> {
+        self.validate_lease_domain(write.lease)?;
+        validate_cancel_text(write.client_order_id, "cancel client_order_id", 128)?;
+        validate_cancel_text(write.provider_order_id, "cancel provider_order_id", 128)?;
+        validate_cancel_text(write.reason_code, "cancel reason_code", 128)?;
+        let token = positive_i64(
+            write.lease.fencing_token,
+            "cancel intent creation fencing_token",
+        )?;
+        let requested_at = postgres_timestamp(write.requested_at)?;
+        let environment = environment_sql(write.lease.environment);
+        let account = write.lease.account_fingerprint.as_hex();
+        let cancel_intent_id = stable_named_uuid(&format!(
+            "cancel:v1:{environment}:{account}:{}:{}",
+            write.client_order_id, write.provider_order_id
+        ));
+        let cancel_outbox_id = stable_child_uuid(cancel_intent_id, "outbox:cancel");
+        let persisted_event_id = stable_child_uuid(cancel_intent_id, "state:persisted");
+        let eligible_event_id = stable_child_uuid(cancel_intent_id, "state:eligible");
+        let payload = json!({
+            "cancel_intent_id": cancel_intent_id,
+            "client_order_id": write.client_order_id,
+            "provider_order_id": write.provider_order_id,
+            "reason_code": write.reason_code,
+            "requested_at": requested_at,
+        });
+        let evidence_hash = cancel_intent_evidence_hash(
+            write.client_order_id,
+            write.provider_order_id,
+            write.reason_code,
+            requested_at,
+            write.lease.environment,
+            write.lease.account_fingerprint,
+            token,
+            &payload,
+        )?;
+        let recovery = CommitRecoveryKey::CancelIntent {
+            cancel_intent_id,
+            cancel_outbox_id,
+            evidence_hash,
+        };
+        let transaction = self
+            .client
+            .build_transaction()
+            .isolation_level(IsolationLevel::Serializable)
+            .start()
+            .await
+            .map_err(|error| StoreError::database("begin_persist_cancel_intent", error))?;
+        assert_current_lease(&transaction, write.lease).await?;
+        let persisted: bool = transaction
+            .query_one(
+                PERSIST_CANCEL_INTENT_SQL,
+                &[
+                    &environment,
+                    &account,
+                    &write.lease.owner_id,
+                    &token,
+                    &cancel_intent_id,
+                    &cancel_outbox_id,
+                    &persisted_event_id,
+                    &eligible_event_id,
+                    &write.client_order_id,
+                    &write.provider_order_id,
+                    &write.reason_code,
+                    &requested_at,
+                    &payload,
+                ],
+            )
+            .await
+            .map_err(|error| StoreError::database("persist_cancel_intent", error))?
+            .try_get("persisted")
+            .map_err(|error| StoreError::database("decode_persist_cancel_intent", error))?;
+        if !persisted {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| StoreError::database("rollback_persist_cancel_intent", error))?;
+            return Err(StoreError::InvalidInput(
+                "cancel intent was not authorized for a known nonterminal broker order".into(),
+            ));
+        }
+        assert_current_lease(&transaction, write.lease).await?;
+        if let Err(source) = transaction.commit().await {
+            return Err(StoreError::CommitUnknown {
+                operation: "commit_persist_cancel_intent",
+                recovery: Box::new(recovery),
+                source,
+            });
+        }
+        Ok(PersistedCancelIntent {
+            cancel_intent_id,
+            cancel_outbox_id,
+        })
+    }
+
+    async fn claim_cancel_dispatch(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+    ) -> Result<Option<ClaimedCancelOutbox>, StoreError> {
+        self.claim_cancel(
+            CLAIM_CANCEL_DISPATCH_SQL,
+            "claim_cancel_outbox_first_dispatch",
+            CancelOutboxClaimKind::FirstDispatch,
+            cancel_outbox_id,
+            lease,
+        )
+        .await
+    }
+
+    async fn claim_cancel_retry(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+    ) -> Result<Option<ClaimedCancelOutbox>, StoreError> {
+        self.claim_cancel(
+            CLAIM_CANCEL_RETRY_SQL,
+            "claim_cancel_outbox_retry_dispatch",
+            CancelOutboxClaimKind::RetryDispatch,
+            cancel_outbox_id,
+            lease,
+        )
+        .await
+    }
+
+    async fn claim_cancel_recovery(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+    ) -> Result<Option<ClaimedCancelOutbox>, StoreError> {
+        self.claim_cancel(
+            CLAIM_CANCEL_RECOVERY_SQL,
+            "claim_cancel_outbox_recovery",
+            CancelOutboxClaimKind::RecoveryLookupOnly,
+            cancel_outbox_id,
+            lease,
+        )
+        .await
+    }
+
+    async fn claim_cancel_terminal_completion(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+    ) -> Result<Option<ClaimedCancelOutbox>, StoreError> {
+        self.claim_cancel(
+            CLAIM_CANCEL_COMPLETION_SQL,
+            "claim_cancel_outbox_terminal_completion",
+            CancelOutboxClaimKind::TerminalCompletionOnly,
+            cancel_outbox_id,
+            lease,
+        )
+        .await
+    }
+
+    async fn record_cancel_request_accepted(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+        accepted: &CancellationRequestAccepted,
+    ) -> Result<bool, StoreError> {
+        self.validate_lease_domain(lease)?;
+        validate_cancel_text(
+            &accepted.provider_order_id,
+            "accepted cancel provider_order_id",
+            128,
+        )?;
+        validate_cancel_text(&accepted.request_id, "accepted cancel request_id", 128)?;
+        let token = positive_i64(lease.fencing_token, "accepted cancel fencing_token")?;
+        let accepted_at = postgres_timestamp(accepted.accepted_at)?;
+        let state_event_id = stable_child_uuid(cancel_outbox_id, "state:cancel-request-accepted");
+        let evidence_hash = cancel_accepted_evidence_hash(accepted, accepted_at, token)?;
+        let recovery = CommitRecoveryKey::CancelRequestAccepted {
+            cancel_outbox_id,
+            state_event_id,
+            evidence_hash,
+        };
+        let environment = environment_sql(lease.environment);
+        let account = lease.account_fingerprint.as_hex();
+        let raw_hash = accepted.raw_payload_hash.as_hex();
+        let transaction = self
+            .client
+            .build_transaction()
+            .isolation_level(IsolationLevel::Serializable)
+            .start()
+            .await
+            .map_err(|error| StoreError::database("begin_record_cancel_accepted", error))?;
+        assert_current_lease(&transaction, lease).await?;
+        let appended: bool = transaction
+            .query_one(
+                APPEND_CANCEL_ACCEPTED_SQL,
+                &[
+                    &environment,
+                    &account,
+                    &cancel_outbox_id,
+                    &lease.owner_id,
+                    &token,
+                    &state_event_id,
+                    &accepted.provider_order_id,
+                    &accepted.request_id,
+                    &raw_hash,
+                    &accepted_at,
+                ],
+            )
+            .await
+            .map_err(|error| StoreError::database("record_cancel_accepted", error))?
+            .try_get("appended")
+            .map_err(|error| StoreError::database("decode_record_cancel_accepted", error))?;
+        if !appended {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| StoreError::database("rollback_cancel_accepted", error))?;
+            return Ok(false);
+        }
+        assert_current_lease(&transaction, lease).await?;
+        if let Err(source) = transaction.commit().await {
+            return Err(StoreError::CommitUnknown {
+                operation: "commit_record_cancel_accepted",
+                recovery: Box::new(recovery),
+                source,
+            });
+        }
+        Ok(true)
+    }
+
+    async fn record_cancel_unknown(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+        detail: &str,
+        occurred_at: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        self.validate_lease_domain(lease)?;
+        validate_cancel_text(detail, "cancel unknown detail", 512)?;
+        let token = positive_i64(lease.fencing_token, "cancel unknown fencing_token")?;
+        let occurred_at = postgres_timestamp(occurred_at)?;
+        let state_event_id = stable_child_uuid(cancel_outbox_id, "state:cancel-unknown");
+        let evidence_hash = cancel_unknown_evidence_hash(detail, token, occurred_at)?;
+        let recovery = CommitRecoveryKey::CancelUnknown {
+            cancel_outbox_id,
+            state_event_id,
+            evidence_hash,
+        };
+        let environment = environment_sql(lease.environment);
+        let account = lease.account_fingerprint.as_hex();
+        let transaction = self
+            .client
+            .build_transaction()
+            .isolation_level(IsolationLevel::Serializable)
+            .start()
+            .await
+            .map_err(|error| StoreError::database("begin_record_cancel_unknown", error))?;
+        assert_current_lease(&transaction, lease).await?;
+        let appended: bool = transaction
+            .query_one(
+                APPEND_CANCEL_UNKNOWN_SQL,
+                &[
+                    &environment,
+                    &account,
+                    &cancel_outbox_id,
+                    &lease.owner_id,
+                    &token,
+                    &state_event_id,
+                    &detail,
+                    &occurred_at,
+                ],
+            )
+            .await
+            .map_err(|error| StoreError::database("record_cancel_unknown", error))?
+            .try_get("appended")
+            .map_err(|error| StoreError::database("decode_record_cancel_unknown", error))?;
+        if !appended {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| StoreError::database("rollback_cancel_unknown", error))?;
+            return Ok(false);
+        }
+        assert_current_lease(&transaction, lease).await?;
+        if let Err(source) = transaction.commit().await {
+            return Err(StoreError::CommitUnknown {
+                operation: "commit_record_cancel_unknown",
+                recovery: Box::new(recovery),
+                source,
+            });
+        }
+        Ok(true)
+    }
+
+    async fn record_cancel_not_dispatched(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+        expected_attempt_count: u32,
+        evidence: &CancellationNotDispatched,
+    ) -> Result<bool, StoreError> {
+        self.validate_lease_domain(lease)?;
+        validate_cancel_text(
+            &evidence.provider_order_id,
+            "not-dispatched provider_order_id",
+            128,
+        )?;
+        if evidence.reason_code != "TRANSPORT_BEFORE_SEND" {
+            return Err(StoreError::InvalidInput(
+                "not-dispatched evidence must use the proven pre-I/O reason code".into(),
+            ));
+        }
+        validate_cancel_text(&evidence.detail, "not-dispatched detail", 512)?;
+        if expected_attempt_count == 0 {
+            return Err(StoreError::InvalidInput(
+                "not-dispatched expected attempt count must be positive".into(),
+            ));
+        }
+        let attempt_count = i32::try_from(expected_attempt_count).map_err(|_| {
+            StoreError::InvalidInput("not-dispatched attempt count exceeds database range".into())
+        })?;
+        let token = positive_i64(lease.fencing_token, "not-dispatched fencing_token")?;
+        let observed_at = postgres_timestamp(evidence.observed_at)?;
+        let computed_hash = cancel_not_dispatched_evidence_hash(
+            &evidence.provider_order_id,
+            observed_at,
+            &evidence.reason_code,
+            &evidence.detail,
+        )?;
+        if computed_hash != evidence.evidence_hash {
+            return Err(StoreError::InvalidInput(
+                "not-dispatched evidence hash does not match its canonical pre-I/O evidence".into(),
+            ));
+        }
+        let state_event_id = stable_child_uuid(
+            cancel_outbox_id,
+            &format!(
+                "state:not-dispatched:{expected_attempt_count}:{}",
+                evidence.evidence_hash
+            ),
+        );
+        let recovery = CommitRecoveryKey::CancelNotDispatched {
+            cancel_outbox_id,
+            state_event_id,
+            attempt_count: expected_attempt_count,
+            evidence_hash: evidence.evidence_hash,
+        };
+        let environment = environment_sql(lease.environment);
+        let account = lease.account_fingerprint.as_hex();
+        let evidence_hash = evidence.evidence_hash.as_hex();
+        let transaction = self
+            .client
+            .build_transaction()
+            .isolation_level(IsolationLevel::Serializable)
+            .start()
+            .await
+            .map_err(|error| StoreError::database("begin_record_cancel_not_dispatched", error))?;
+        assert_current_lease(&transaction, lease).await?;
+        let appended: bool = transaction
+            .query_one(
+                APPEND_CANCEL_NOT_DISPATCHED_SQL,
+                &[
+                    &environment,
+                    &account,
+                    &cancel_outbox_id,
+                    &lease.owner_id,
+                    &token,
+                    &state_event_id,
+                    &evidence.provider_order_id,
+                    &attempt_count,
+                    &evidence.reason_code,
+                    &evidence.detail,
+                    &evidence_hash,
+                    &observed_at,
+                ],
+            )
+            .await
+            .map_err(|error| StoreError::database("record_cancel_not_dispatched", error))?
+            .try_get("appended")
+            .map_err(|error| StoreError::database("decode_cancel_not_dispatched", error))?;
+        if !appended {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| StoreError::database("rollback_cancel_not_dispatched", error))?;
+            return Ok(false);
+        }
+        assert_current_lease(&transaction, lease).await?;
+        if let Err(source) = transaction.commit().await {
+            return Err(StoreError::CommitUnknown {
+                operation: "commit_record_cancel_not_dispatched",
+                recovery: Box::new(recovery),
+                source,
+            });
+        }
+        Ok(true)
+    }
+
+    async fn finalize_cancel_outbox(
+        &mut self,
+        cancel_outbox_id: Uuid,
+        lease: &FencedLease,
+        terminal_broker_event_id: Uuid,
+        completion_reason: &str,
+    ) -> Result<bool, StoreError> {
+        self.validate_lease_domain(lease)?;
+        validate_cancel_text(completion_reason, "cancel completion reason", 128)?;
+        let token = positive_i64(lease.fencing_token, "cancel completion fencing_token")?;
+        let terminal_state_event_id = stable_child_uuid(
+            cancel_outbox_id,
+            &format!("state:terminal:{terminal_broker_event_id}"),
+        );
+        let recovery = CommitRecoveryKey::CancelFinalization {
+            cancel_outbox_id,
+            terminal_state_event_id,
+            terminal_broker_event_id,
+            completion_reason: completion_reason.to_owned(),
+        };
+        let environment = environment_sql(lease.environment);
+        let account = lease.account_fingerprint.as_hex();
+        let transaction = self
+            .client
+            .build_transaction()
+            .isolation_level(IsolationLevel::Serializable)
+            .start()
+            .await
+            .map_err(|error| StoreError::database("begin_finalize_cancel_outbox", error))?;
+        assert_current_lease(&transaction, lease).await?;
+        let finalized: bool = transaction
+            .query_one(
+                FINALIZE_CANCEL_OUTBOX_SQL,
+                &[
+                    &environment,
+                    &account,
+                    &cancel_outbox_id,
+                    &lease.owner_id,
+                    &token,
+                    &terminal_state_event_id,
+                    &terminal_broker_event_id,
+                    &completion_reason,
+                ],
+            )
+            .await
+            .map_err(|error| StoreError::database("finalize_cancel_outbox", error))?
+            .try_get("finalized")
+            .map_err(|error| StoreError::database("decode_finalize_cancel_outbox", error))?;
+        if !finalized {
+            transaction
+                .rollback()
+                .await
+                .map_err(|error| StoreError::database("rollback_finalize_cancel_outbox", error))?;
+            return Ok(false);
+        }
+        assert_current_lease(&transaction, lease).await?;
+        if let Err(source) = transaction.commit().await {
+            return Err(StoreError::CommitUnknown {
+                operation: "commit_finalize_cancel_outbox",
+                recovery: Box::new(recovery),
+                source,
+            });
+        }
+        Ok(true)
+    }
+
+    async fn discover_unresolved_cancels(
+        &mut self,
+        lease: &FencedLease,
+        limit: u16,
+    ) -> Result<Vec<UnresolvedCancelOutbox>, StoreError> {
+        self.validate_lease_domain(lease)?;
+        if limit == 0 || limit > 1000 {
+            return Err(StoreError::InvalidInput(
+                "unresolved cancel discovery limit must be 1 through 1000".into(),
+            ));
+        }
+        let environment = environment_sql(lease.environment);
+        let account = lease.account_fingerprint.as_hex();
+        let token = positive_i64(lease.fencing_token, "cancel discovery fencing_token")?;
+        let limit = i32::from(limit);
+        self.client
+            .query(
+                LIST_UNRESOLVED_CANCELS_SQL,
+                &[&environment, &account, &lease.owner_id, &token, &limit],
+            )
+            .await
+            .map_err(|error| StoreError::database("list_unresolved_cancel_outboxes", error))?
+            .iter()
+            .map(decode_unresolved_cancel_outbox)
+            .collect()
     }
 
     async fn record_broker_event(
@@ -2474,6 +3234,407 @@ fn decode_unresolved_outbox(row: &Row) -> Result<UnresolvedOutbox, StoreError> {
     })
 }
 
+fn decode_claimed_cancel_outbox(
+    row: &Row,
+    kind: CancelOutboxClaimKind,
+    lease: &FencedLease,
+) -> Result<ClaimedCancelOutbox, StoreError> {
+    let environment: String = row
+        .try_get("environment")
+        .map_err(|error| StoreError::database("decode_cancel_environment", error))?;
+    let environment = parse_environment(&environment)?;
+    let account: String = row
+        .try_get("account_fingerprint")
+        .map_err(|error| StoreError::database("decode_cancel_account", error))?;
+    let account_fingerprint = HashDigest::from_str(&account)
+        .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+    let claim: Option<i64> = row
+        .try_get("claim_fencing_token")
+        .map_err(|error| StoreError::database("decode_cancel_claim_fence", error))?;
+    let claimed_by: Option<Uuid> = row
+        .try_get("claimed_by")
+        .map_err(|error| StoreError::database("decode_cancel_claim_owner", error))?;
+    let claimed_at: Option<DateTime<Utc>> = row
+        .try_get("claimed_at")
+        .map_err(|error| StoreError::database("decode_cancel_claim_time", error))?;
+    let claim_fencing_token = positive_u64(
+        claim.ok_or_else(|| StoreError::InvalidInput("cancel claim lacks a fence".into()))?,
+        "cancel claim fence",
+    )?;
+    let claimed_by =
+        claimed_by.ok_or_else(|| StoreError::InvalidInput("cancel claim lacks an owner".into()))?;
+    if environment != lease.environment
+        || account_fingerprint != lease.account_fingerprint
+        || claim_fencing_token != lease.fencing_token
+        || claimed_by != lease.owner_id
+    {
+        return Err(StoreError::InvalidInput(
+            "claimed cancellation escaped its owner/account/environment fence".into(),
+        ));
+    }
+    let created: i64 = row
+        .try_get("created_fencing_token")
+        .map_err(|error| StoreError::database("decode_cancel_creation_fence", error))?;
+    let attempts: i32 = row
+        .try_get("attempt_count")
+        .map_err(|error| StoreError::database("decode_cancel_attempt_count", error))?;
+    let current_state: String = row
+        .try_get("current_state")
+        .map_err(|error| StoreError::database("decode_cancel_current_state", error))?;
+    let state_allowed = match kind {
+        CancelOutboxClaimKind::FirstDispatch => current_state == "dispatch_started",
+        CancelOutboxClaimKind::RetryDispatch => current_state == "dispatch_started",
+        CancelOutboxClaimKind::RecoveryLookupOnly => matches!(
+            current_state.as_str(),
+            "dispatch_started" | "request_accepted" | "cancel_unknown"
+        ),
+        CancelOutboxClaimKind::TerminalCompletionOnly => matches!(
+            current_state.as_str(),
+            "eligible"
+                | "dispatch_started"
+                | "request_accepted"
+                | "cancel_unknown"
+                | "not_dispatched"
+        ),
+    };
+    if !state_allowed {
+        return Err(StoreError::InvalidInput(
+            "cancel claim returned a state outside its authority class".into(),
+        ));
+    }
+    Ok(ClaimedCancelOutbox {
+        kind,
+        cancel_outbox_id: row
+            .try_get("cancel_outbox_id")
+            .map_err(|error| StoreError::database("decode_cancel_outbox_id", error))?,
+        cancel_intent_id: row
+            .try_get("cancel_intent_id")
+            .map_err(|error| StoreError::database("decode_cancel_intent_id", error))?,
+        client_order_id: row
+            .try_get("client_order_id")
+            .map_err(|error| StoreError::database("decode_cancel_client_id", error))?,
+        provider_order_id: row
+            .try_get("provider_order_id")
+            .map_err(|error| StoreError::database("decode_cancel_provider_id", error))?,
+        reason_code: row
+            .try_get("reason_code")
+            .map_err(|error| StoreError::database("decode_cancel_reason", error))?,
+        requested_at: row
+            .try_get("requested_at")
+            .map_err(|error| StoreError::database("decode_cancel_requested_at", error))?,
+        environment,
+        account_fingerprint,
+        created_fencing_token: positive_u64(created, "cancel creation fence")?,
+        claim_fencing_token,
+        payload: row
+            .try_get("payload")
+            .map_err(|error| StoreError::database("decode_cancel_payload", error))?,
+        available_at: row
+            .try_get("available_at")
+            .map_err(|error| StoreError::database("decode_cancel_available_at", error))?,
+        claimed_by,
+        claimed_at: claimed_at
+            .ok_or_else(|| StoreError::InvalidInput("cancel claim lacks a timestamp".into()))?,
+        attempt_count: u32::try_from(attempts)
+            .map_err(|_| StoreError::InvalidInput("cancel attempt count is negative".into()))?,
+        current_state,
+    })
+}
+
+fn decode_unresolved_cancel_outbox(row: &Row) -> Result<UnresolvedCancelOutbox, StoreError> {
+    let created: i64 = row
+        .try_get("created_fencing_token")
+        .map_err(|error| StoreError::database("decode_unresolved_cancel_fence", error))?;
+    let current_state: String = row
+        .try_get("current_state")
+        .map_err(|error| StoreError::database("decode_unresolved_cancel_state", error))?;
+    if !matches!(
+        current_state.as_str(),
+        "eligible" | "dispatch_started" | "request_accepted" | "cancel_unknown" | "not_dispatched"
+    ) {
+        return Err(StoreError::InvalidInput(
+            "unresolved cancellation has an unknown state".into(),
+        ));
+    }
+    let payload_hash: Option<String> = row
+        .try_get("payload_hash")
+        .map_err(|error| StoreError::database("decode_cancel_outcome_hash", error))?;
+    let payload_hash = payload_hash
+        .map(|value| {
+            HashDigest::from_str(&value)
+                .map_err(|error| StoreError::InvalidInput(error.to_string()))
+        })
+        .transpose()?;
+    let client_order_id: String = row
+        .try_get("client_order_id")
+        .map_err(|error| StoreError::database("decode_unresolved_cancel_client", error))?;
+    let provider_order_id: String = row
+        .try_get("provider_order_id")
+        .map_err(|error| StoreError::database("decode_unresolved_cancel_provider", error))?;
+    let state_occurred_at: DateTime<Utc> = row
+        .try_get("state_occurred_at")
+        .map_err(|error| StoreError::database("decode_cancel_state_time", error))?;
+    let state_reason_code: String = row
+        .try_get("state_reason_code")
+        .map_err(|error| StoreError::database("decode_cancel_state_reason", error))?;
+    let detail: String = row
+        .try_get("detail")
+        .map_err(|error| StoreError::database("decode_cancel_detail", error))?;
+    let state_provider_order_id: Option<String> = row
+        .try_get("state_not_dispatched_provider_order_id")
+        .map_err(|error| StoreError::database("decode_cancel_state_provider", error))?;
+    let state_attempt_count: Option<i32> = row
+        .try_get("state_dispatch_attempt_count")
+        .map_err(|error| StoreError::database("decode_cancel_state_attempt", error))?;
+    let current_dispatch_attempt_count = state_attempt_count
+        .map(|attempt| {
+            if attempt < 1 {
+                return Err(StoreError::InvalidInput(
+                    "unresolved cancellation has a nonpositive dispatch attempt".into(),
+                ));
+            }
+            u32::try_from(attempt).map_err(|_| {
+                StoreError::InvalidInput(
+                    "unresolved cancellation has an invalid dispatch attempt".into(),
+                )
+            })
+        })
+        .transpose()?;
+    let state_evidence_hash: Option<String> = row
+        .try_get("state_evidence_hash")
+        .map_err(|error| StoreError::database("decode_cancel_state_evidence", error))?;
+    let not_dispatched_evidence = if current_state == "not_dispatched" {
+        let state_provider_order_id = state_provider_order_id.ok_or_else(|| {
+            StoreError::InvalidInput("not-dispatched state lacks provider identity".into())
+        })?;
+        let evidence_hash = state_evidence_hash
+            .as_deref()
+            .ok_or_else(|| {
+                StoreError::InvalidInput("not-dispatched state lacks evidence hash".into())
+            })
+            .and_then(|value| {
+                HashDigest::from_str(value)
+                    .map_err(|error| StoreError::InvalidInput(error.to_string()))
+            })?;
+        if state_provider_order_id != provider_order_id
+            || state_reason_code != "TRANSPORT_BEFORE_SEND"
+            || current_dispatch_attempt_count.is_none()
+            || cancel_not_dispatched_evidence_hash(
+                &state_provider_order_id,
+                state_occurred_at,
+                &state_reason_code,
+                &detail,
+            )? != evidence_hash
+        {
+            return Err(StoreError::InvalidInput(
+                "not-dispatched state evidence does not match its durable identity".into(),
+            ));
+        }
+        Some(CancellationNotDispatched {
+            provider_order_id: state_provider_order_id,
+            observed_at: state_occurred_at,
+            reason_code: state_reason_code.clone(),
+            detail: detail.clone(),
+            evidence_hash,
+        })
+    } else {
+        if state_provider_order_id.is_some()
+            || state_evidence_hash.is_some()
+            || (current_state == "dispatch_started") != current_dispatch_attempt_count.is_some()
+        {
+            return Err(StoreError::InvalidInput(
+                "unresolved cancellation state has misplaced attempt evidence".into(),
+            ));
+        }
+        None
+    };
+    let broker_event_id: Option<Uuid> = row
+        .try_get("broker_event_id")
+        .map_err(|error| StoreError::database("decode_cancel_broker_event", error))?;
+    if broker_event_id.is_some() {
+        return Err(StoreError::InvalidInput(
+            "unresolved cancellation unexpectedly contains terminal cancel-state evidence".into(),
+        ));
+    }
+    let terminal_broker_evidence =
+        decode_terminal_cancel_broker_evidence(row, &provider_order_id, &client_order_id)?;
+    Ok(UnresolvedCancelOutbox {
+        cancel_outbox_id: row
+            .try_get("cancel_outbox_id")
+            .map_err(|error| StoreError::database("decode_unresolved_cancel_outbox", error))?,
+        cancel_intent_id: row
+            .try_get("cancel_intent_id")
+            .map_err(|error| StoreError::database("decode_unresolved_cancel_intent", error))?,
+        client_order_id,
+        provider_order_id,
+        reason_code: row
+            .try_get("reason_code")
+            .map_err(|error| StoreError::database("decode_unresolved_cancel_reason", error))?,
+        requested_at: row
+            .try_get("requested_at")
+            .map_err(|error| StoreError::database("decode_unresolved_cancel_requested", error))?,
+        created_fencing_token: positive_u64(created, "unresolved cancel creation fence")?,
+        payload: row
+            .try_get("payload")
+            .map_err(|error| StoreError::database("decode_unresolved_cancel_payload", error))?,
+        available_at: row
+            .try_get("available_at")
+            .map_err(|error| StoreError::database("decode_unresolved_cancel_available", error))?,
+        current_state,
+        request_id: row
+            .try_get("request_id")
+            .map_err(|error| StoreError::database("decode_cancel_request_id", error))?,
+        payload_hash,
+        detail,
+        broker_event_id,
+        state_occurred_at,
+        current_dispatch_attempt_count,
+        not_dispatched_evidence,
+        terminal_broker_evidence,
+    })
+}
+
+fn decode_terminal_cancel_broker_evidence(
+    row: &Row,
+    expected_provider_order_id: &str,
+    expected_client_order_id: &str,
+) -> Result<Option<PersistedTerminalBrokerEvent>, StoreError> {
+    let broker_event_id: Option<Uuid> = row
+        .try_get("terminal_broker_event_id")
+        .map_err(|error| StoreError::database("decode_terminal_cancel_broker_event", error))?;
+    let provider_order_id: Option<String> = row
+        .try_get("terminal_provider_order_id")
+        .map_err(|error| StoreError::database("decode_terminal_cancel_provider", error))?;
+    let client_order_id: Option<String> = row
+        .try_get("terminal_client_order_id")
+        .map_err(|error| StoreError::database("decode_terminal_cancel_client", error))?;
+    let status: Option<String> = row
+        .try_get("terminal_provider_status")
+        .map_err(|error| StoreError::database("decode_terminal_cancel_status", error))?;
+    let recognized: Option<bool> = row
+        .try_get("terminal_recognized_status")
+        .map_err(|error| StoreError::database("decode_terminal_cancel_recognized", error))?;
+    let filled_quantity: Option<String> = row
+        .try_get("terminal_cumulative_filled_quantity")
+        .map_err(|error| StoreError::database("decode_terminal_cancel_quantity", error))?;
+    let average_fill_price: Option<String> = row
+        .try_get("terminal_average_fill_price")
+        .map_err(|error| StoreError::database("decode_terminal_cancel_price", error))?;
+    let provider_timestamp: Option<DateTime<Utc>> = row
+        .try_get("terminal_provider_occurred_at")
+        .map_err(|error| StoreError::database("decode_terminal_cancel_provider_time", error))?;
+    let received_at: Option<DateTime<Utc>> = row
+        .try_get("terminal_received_at")
+        .map_err(|error| StoreError::database("decode_terminal_cancel_received_time", error))?;
+    let request_id: Option<String> = row
+        .try_get("terminal_request_id")
+        .map_err(|error| StoreError::database("decode_terminal_cancel_request", error))?;
+    let raw_hash: Option<String> = row
+        .try_get("terminal_raw_hash")
+        .map_err(|error| StoreError::database("decode_terminal_cancel_hash", error))?;
+
+    let any_evidence = broker_event_id.is_some()
+        || provider_order_id.is_some()
+        || client_order_id.is_some()
+        || status.is_some()
+        || recognized.is_some()
+        || filled_quantity.is_some()
+        || average_fill_price.is_some()
+        || provider_timestamp.is_some()
+        || received_at.is_some()
+        || request_id.is_some()
+        || raw_hash.is_some();
+    if !any_evidence {
+        return Ok(None);
+    }
+
+    let broker_event_id = broker_event_id.ok_or_else(|| {
+        StoreError::InvalidInput("terminal cancellation evidence lacks broker_event_id".into())
+    })?;
+    let provider_order_id = provider_order_id.ok_or_else(|| {
+        StoreError::InvalidInput("terminal cancellation evidence lacks provider identity".into())
+    })?;
+    let client_order_id = client_order_id.ok_or_else(|| {
+        StoreError::InvalidInput("terminal cancellation evidence lacks client identity".into())
+    })?;
+    let status = status.ok_or_else(|| {
+        StoreError::InvalidInput("terminal cancellation evidence lacks provider status".into())
+    })?;
+    let recognized = recognized.ok_or_else(|| {
+        StoreError::InvalidInput("terminal cancellation evidence lacks recognition state".into())
+    })?;
+    let filled_quantity = filled_quantity.ok_or_else(|| {
+        StoreError::InvalidInput("terminal cancellation evidence lacks filled quantity".into())
+    })?;
+    let provider_timestamp = provider_timestamp.ok_or_else(|| {
+        StoreError::InvalidInput("terminal cancellation evidence lacks provider timestamp".into())
+    })?;
+    let received_at = received_at.ok_or_else(|| {
+        StoreError::InvalidInput("terminal cancellation evidence lacks receive timestamp".into())
+    })?;
+    let raw_hash = raw_hash.ok_or_else(|| {
+        StoreError::InvalidInput("terminal cancellation evidence lacks raw payload hash".into())
+    })?;
+
+    if provider_order_id != expected_provider_order_id
+        || client_order_id != expected_client_order_id
+        || !recognized
+        || !is_terminal_broker_status(&status)
+        || received_at < provider_timestamp
+    {
+        return Err(StoreError::InvalidInput(
+            "terminal cancellation evidence violates identity, status, or timestamp invariants"
+                .into(),
+        ));
+    }
+    if let Some(request_id) = request_id.as_deref() {
+        validate_cancel_text(request_id, "terminal broker request_id", 128)?;
+    }
+    let filled_quantity = parse_whole_quantity_text(&filled_quantity)?;
+    let fill_price = average_fill_price
+        .map(|value| {
+            Price::from_str(&value).map_err(|error| StoreError::InvalidInput(error.to_string()))
+        })
+        .transpose()?;
+    if fill_price.is_some_and(|price| !price.fixed().is_positive())
+        || (filled_quantity != WholeQuantity::ZERO && fill_price.is_none())
+    {
+        return Err(StoreError::InvalidInput(
+            "terminal cancellation evidence has invalid fill-price truth".into(),
+        ));
+    }
+    let raw_payload_hash = HashDigest::from_str(&raw_hash)
+        .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+    Ok(Some(PersistedTerminalBrokerEvent {
+        broker_event_id,
+        event: BrokerEvent {
+            provider_order_id: Some(provider_order_id),
+            client_order_id,
+            status,
+            filled_quantity,
+            fill_price,
+            provider_timestamp,
+            received_at,
+            raw_payload_hash,
+            request_id,
+        },
+    }))
+}
+
+fn parse_whole_quantity_text(value: &str) -> Result<WholeQuantity, StoreError> {
+    let fixed = trader_core::Fixed::from_str(value)
+        .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+    if fixed.is_negative() || fixed.scaled() % trader_core::Fixed::SCALE != 0 {
+        return Err(StoreError::InvalidInput(
+            "terminal broker quantity is not a nonnegative whole quantity".into(),
+        ));
+    }
+    let quantity = u64::try_from(fixed.scaled() / trader_core::Fixed::SCALE).map_err(|_| {
+        StoreError::InvalidInput("terminal broker quantity exceeds whole-share range".into())
+    })?;
+    Ok(WholeQuantity::new(quantity))
+}
+
 fn environment_sql(environment: Environment) -> &'static str {
     match environment {
         Environment::Shadow => "shadow",
@@ -2682,6 +3843,107 @@ fn stable_child_uuid(namespace: Uuid, label: &str) -> Uuid {
 
 fn stable_named_uuid(label: &str) -> Uuid {
     Uuid::new_v5(&Uuid::NAMESPACE_OID, label.as_bytes())
+}
+
+/// PostgreSQL `TIMESTAMPTZ` stores microseconds.  Normalize before both
+/// persistence and hashing so CommitUnknown recovery compares the exact value
+/// that can round-trip through the database.
+fn postgres_timestamp(value: DateTime<Utc>) -> Result<DateTime<Utc>, StoreError> {
+    value
+        .with_nanosecond((value.nanosecond() / 1_000) * 1_000)
+        .ok_or_else(|| StoreError::InvalidInput("timestamp cannot be normalized".into()))
+}
+
+fn validate_cancel_text(value: &str, field: &str, maximum_bytes: usize) -> Result<(), StoreError> {
+    if value.trim().is_empty() || value.trim() != value || value.len() > maximum_bytes {
+        return Err(StoreError::InvalidInput(format!(
+            "{field} must contain 1 through {maximum_bytes} bytes without surrounding whitespace"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cancel_intent_evidence_hash(
+    client_order_id: &str,
+    provider_order_id: &str,
+    reason_code: &str,
+    requested_at: DateTime<Utc>,
+    environment: Environment,
+    account_fingerprint: HashDigest,
+    fencing_token: i64,
+    payload: &Value,
+) -> Result<HashDigest, StoreError> {
+    HashDigest::of_json(&json!({
+        "client_order_id": client_order_id,
+        "provider_order_id": provider_order_id,
+        "reason_code": reason_code,
+        "requested_at": requested_at,
+        "environment": environment_sql(environment),
+        "account_fingerprint": account_fingerprint.as_hex(),
+        "fencing_token": fencing_token,
+        "payload": payload,
+    }))
+    .map_err(|error| StoreError::InvalidInput(error.to_string()))
+}
+
+fn cancel_accepted_evidence_hash(
+    accepted: &CancellationRequestAccepted,
+    accepted_at: DateTime<Utc>,
+    fencing_token: i64,
+) -> Result<HashDigest, StoreError> {
+    cancel_accepted_evidence_parts(
+        &accepted.provider_order_id,
+        &accepted.request_id,
+        accepted.raw_payload_hash,
+        accepted_at,
+        fencing_token,
+    )
+}
+
+fn cancel_accepted_evidence_parts(
+    provider_order_id: &str,
+    request_id: &str,
+    payload_hash: HashDigest,
+    accepted_at: DateTime<Utc>,
+    fencing_token: i64,
+) -> Result<HashDigest, StoreError> {
+    HashDigest::of_json(&json!({
+        "provider_order_id": provider_order_id,
+        "request_id": request_id,
+        "payload_hash": payload_hash.as_hex(),
+        "accepted_at": accepted_at,
+        "fencing_token": fencing_token,
+    }))
+    .map_err(|error| StoreError::InvalidInput(error.to_string()))
+}
+
+fn cancel_unknown_evidence_hash(
+    detail: &str,
+    fencing_token: i64,
+    occurred_at: DateTime<Utc>,
+) -> Result<HashDigest, StoreError> {
+    HashDigest::of_json(&json!({
+        "detail": detail,
+        "fencing_token": fencing_token,
+        "occurred_at": occurred_at,
+    }))
+    .map_err(|error| StoreError::InvalidInput(error.to_string()))
+}
+
+fn cancel_not_dispatched_evidence_hash(
+    provider_order_id: &str,
+    observed_at: DateTime<Utc>,
+    reason_code: &str,
+    detail: &str,
+) -> Result<HashDigest, StoreError> {
+    HashDigest::of_json(&json!({
+        "provider_order_id": provider_order_id,
+        "observed_at": observed_at,
+        "reason_code": reason_code,
+        "detail": detail,
+    }))
+    .map_err(|error| StoreError::InvalidInput(error.to_string()))
 }
 
 fn submission_unknown_evidence_hash(
@@ -2933,6 +4195,358 @@ WHERE outbox_id = $1
                 },
             )
         }
+        CommitRecoveryKey::CancelIntent {
+            cancel_intent_id,
+            cancel_outbox_id,
+            evidence_hash,
+        } => {
+            let persisted_event_id = stable_child_uuid(*cancel_intent_id, "state:persisted");
+            let eligible_event_id = stable_child_uuid(*cancel_intent_id, "state:eligible");
+            let row = client
+                .query_opt(
+                    r#"
+SELECT
+    cancellation.client_order_id,
+    cancellation.provider_order_id,
+    cancellation.reason_code,
+    cancellation.requested_at,
+    cancellation.environment,
+    cancellation.account_fingerprint,
+    cancellation.created_fencing_token,
+    outbox.payload,
+    (
+        outbox.environment = cancellation.environment
+        AND outbox.account_fingerprint = cancellation.account_fingerprint
+        AND outbox.created_fencing_token = cancellation.created_fencing_token
+        AND outbox.available_at = cancellation.requested_at
+        AND persisted.reason_code = 'CANCEL_INTENT_PERSISTED'
+        AND persisted.fencing_token = cancellation.created_fencing_token
+        AND persisted.occurred_at = cancellation.requested_at
+        AND eligible.reason_code = 'CANCEL_INTENT_ELIGIBLE'
+        AND eligible.fencing_token = cancellation.created_fencing_token
+        AND eligible.occurred_at = cancellation.requested_at
+    ) AS chain_matches
+FROM public.cancel_intents AS cancellation
+JOIN public.cancel_outbox AS outbox
+  ON outbox.cancel_intent_id = cancellation.cancel_intent_id
+JOIN public.cancel_state_events AS persisted
+  ON persisted.cancel_intent_id = cancellation.cancel_intent_id
+ AND persisted.cancel_state_event_id = $3
+ AND persisted.state = 'persisted'
+JOIN public.cancel_state_events AS eligible
+  ON eligible.cancel_intent_id = cancellation.cancel_intent_id
+ AND eligible.cancel_state_event_id = $4
+ AND eligible.state = 'eligible'
+WHERE cancellation.cancel_intent_id = $1
+  AND outbox.cancel_outbox_id = $2
+"#,
+                    &[
+                        cancel_intent_id,
+                        cancel_outbox_id,
+                        &persisted_event_id,
+                        &eligible_event_id,
+                    ],
+                )
+                .await
+                .map_err(|error| StoreError::database("resolve_cancel_intent_commit", error))?;
+            let Some(row) = row else {
+                return Ok(CommitResolution::NotCommitted);
+            };
+            let client_order_id: String = row
+                .try_get("client_order_id")
+                .map_err(|error| StoreError::database("decode_cancel_client_id", error))?;
+            let provider_order_id: String = row
+                .try_get("provider_order_id")
+                .map_err(|error| StoreError::database("decode_cancel_provider_id", error))?;
+            let reason_code: String = row
+                .try_get("reason_code")
+                .map_err(|error| StoreError::database("decode_cancel_reason", error))?;
+            let requested_at: DateTime<Utc> = row
+                .try_get("requested_at")
+                .map_err(|error| StoreError::database("decode_cancel_requested", error))?;
+            let environment: String = row
+                .try_get("environment")
+                .map_err(|error| StoreError::database("decode_cancel_environment", error))?;
+            let account: String = row
+                .try_get("account_fingerprint")
+                .map_err(|error| StoreError::database("decode_cancel_account", error))?;
+            let fencing_token: i64 = row
+                .try_get("created_fencing_token")
+                .map_err(|error| StoreError::database("decode_cancel_creation_fence", error))?;
+            let payload: Value = row
+                .try_get("payload")
+                .map_err(|error| StoreError::database("decode_cancel_payload", error))?;
+            let chain_matches: bool = row
+                .try_get("chain_matches")
+                .map_err(|error| StoreError::database("decode_cancel_chain_evidence", error))?;
+            let stored_hash = cancel_intent_evidence_hash(
+                &client_order_id,
+                &provider_order_id,
+                &reason_code,
+                requested_at,
+                parse_environment(&environment)?,
+                HashDigest::from_str(&account)
+                    .map_err(|error| StoreError::InvalidInput(error.to_string()))?,
+                fencing_token,
+                &payload,
+            )?;
+            Ok(if chain_matches && stored_hash == *evidence_hash {
+                CommitResolution::Committed
+            } else {
+                CommitResolution::ConflictingEvidence
+            })
+        }
+        CommitRecoveryKey::CancelRequestAccepted {
+            cancel_outbox_id,
+            state_event_id,
+            evidence_hash,
+        } => {
+            let row = client
+                .query_opt(
+                    r#"
+SELECT
+    cancellation.provider_order_id,
+    event.reason_code,
+    event.request_id,
+    event.payload_hash,
+    event.occurred_at,
+    event.fencing_token
+FROM public.cancel_state_events AS event
+JOIN public.cancel_intents AS cancellation
+  ON cancellation.cancel_intent_id = event.cancel_intent_id
+JOIN public.cancel_outbox AS outbox
+  ON outbox.cancel_intent_id = cancellation.cancel_intent_id
+WHERE outbox.cancel_outbox_id = $1
+  AND event.cancel_state_event_id = $2
+  AND event.state = 'request_accepted'
+"#,
+                    &[cancel_outbox_id, state_event_id],
+                )
+                .await
+                .map_err(|error| StoreError::database("resolve_cancel_accepted_commit", error))?;
+            let Some(row) = row else {
+                return Ok(CommitResolution::NotCommitted);
+            };
+            let provider_order_id: String = row
+                .try_get("provider_order_id")
+                .map_err(|error| StoreError::database("decode_cancel_provider_id", error))?;
+            let reason_code: String = row
+                .try_get("reason_code")
+                .map_err(|error| StoreError::database("decode_cancel_outcome_reason", error))?;
+            let request_id: String = row
+                .try_get("request_id")
+                .map_err(|error| StoreError::database("decode_cancel_request_id", error))?;
+            let payload_hash: String = row
+                .try_get("payload_hash")
+                .map_err(|error| StoreError::database("decode_cancel_payload_hash", error))?;
+            let accepted_at: DateTime<Utc> = row
+                .try_get("occurred_at")
+                .map_err(|error| StoreError::database("decode_cancel_accepted_at", error))?;
+            let fencing_token: i64 = row
+                .try_get("fencing_token")
+                .map_err(|error| StoreError::database("decode_cancel_outcome_fence", error))?;
+            let stored_hash = cancel_accepted_evidence_parts(
+                &provider_order_id,
+                &request_id,
+                HashDigest::from_str(&payload_hash)
+                    .map_err(|error| StoreError::InvalidInput(error.to_string()))?,
+                accepted_at,
+                fencing_token,
+            )?;
+            Ok(
+                if reason_code == "CANCEL_REQUEST_ACCEPTED" && stored_hash == *evidence_hash {
+                    CommitResolution::Committed
+                } else {
+                    CommitResolution::ConflictingEvidence
+                },
+            )
+        }
+        CommitRecoveryKey::CancelUnknown {
+            cancel_outbox_id,
+            state_event_id,
+            evidence_hash,
+        } => {
+            let row = client
+                .query_opt(
+                    r#"
+SELECT event.reason_code, event.detail, event.fencing_token, event.occurred_at
+FROM public.cancel_state_events AS event
+JOIN public.cancel_outbox AS outbox
+  ON outbox.cancel_intent_id = event.cancel_intent_id
+WHERE outbox.cancel_outbox_id = $1
+  AND event.cancel_state_event_id = $2
+  AND event.state = 'cancel_unknown'
+"#,
+                    &[cancel_outbox_id, state_event_id],
+                )
+                .await
+                .map_err(|error| StoreError::database("resolve_cancel_unknown_commit", error))?;
+            let Some(row) = row else {
+                return Ok(CommitResolution::NotCommitted);
+            };
+            let detail: String = row
+                .try_get("detail")
+                .map_err(|error| StoreError::database("decode_cancel_unknown_detail", error))?;
+            let reason_code: String = row
+                .try_get("reason_code")
+                .map_err(|error| StoreError::database("decode_cancel_unknown_reason", error))?;
+            let fencing_token: i64 = row
+                .try_get("fencing_token")
+                .map_err(|error| StoreError::database("decode_cancel_unknown_fence", error))?;
+            let occurred_at: DateTime<Utc> = row
+                .try_get("occurred_at")
+                .map_err(|error| StoreError::database("decode_cancel_unknown_time", error))?;
+            let stored_hash = cancel_unknown_evidence_hash(&detail, fencing_token, occurred_at)?;
+            Ok(
+                if reason_code == "CANCEL_OUTCOME_UNKNOWN" && stored_hash == *evidence_hash {
+                    CommitResolution::Committed
+                } else {
+                    CommitResolution::ConflictingEvidence
+                },
+            )
+        }
+        CommitRecoveryKey::CancelNotDispatched {
+            cancel_outbox_id,
+            state_event_id,
+            attempt_count,
+            evidence_hash,
+        } => {
+            let row = client
+                .query_opt(
+                    r#"
+SELECT
+    cancellation.provider_order_id,
+    event.reason_code,
+    event.not_dispatched_provider_order_id,
+    event.dispatch_attempt_count,
+    event.evidence_hash,
+    event.detail,
+    event.occurred_at
+FROM public.cancel_state_events AS event
+JOIN public.cancel_intents AS cancellation
+  ON cancellation.cancel_intent_id = event.cancel_intent_id
+JOIN public.cancel_outbox AS outbox
+  ON outbox.cancel_intent_id = cancellation.cancel_intent_id
+WHERE outbox.cancel_outbox_id = $1
+  AND event.cancel_state_event_id = $2
+  AND event.state = 'not_dispatched'
+"#,
+                    &[cancel_outbox_id, state_event_id],
+                )
+                .await
+                .map_err(|error| {
+                    StoreError::database("resolve_cancel_not_dispatched_commit", error)
+                })?;
+            let Some(row) = row else {
+                return Ok(CommitResolution::NotCommitted);
+            };
+            let durable_provider_order_id: String = row
+                .try_get("provider_order_id")
+                .map_err(|error| StoreError::database("decode_cancel_provider_id", error))?;
+            let event_provider_order_id: String = row
+                .try_get("not_dispatched_provider_order_id")
+                .map_err(|error| {
+                StoreError::database("decode_not_dispatched_provider_id", error)
+            })?;
+            let reason_code: String = row
+                .try_get("reason_code")
+                .map_err(|error| StoreError::database("decode_not_dispatched_reason", error))?;
+            let stored_attempt: i32 = row
+                .try_get("dispatch_attempt_count")
+                .map_err(|error| StoreError::database("decode_not_dispatched_attempt", error))?;
+            let stored_evidence: String = row
+                .try_get("evidence_hash")
+                .map_err(|error| StoreError::database("decode_not_dispatched_evidence", error))?;
+            let detail: String = row
+                .try_get("detail")
+                .map_err(|error| StoreError::database("decode_not_dispatched_detail", error))?;
+            let observed_at: DateTime<Utc> = row
+                .try_get("occurred_at")
+                .map_err(|error| StoreError::database("decode_not_dispatched_time", error))?;
+            let stored_attempt = u32::try_from(stored_attempt).map_err(|_| {
+                StoreError::InvalidInput(
+                    "durable not-dispatched attempt count is not positive".into(),
+                )
+            })?;
+            let stored_evidence = HashDigest::from_str(&stored_evidence)
+                .map_err(|error| StoreError::InvalidInput(error.to_string()))?;
+            let computed_evidence = cancel_not_dispatched_evidence_hash(
+                &event_provider_order_id,
+                observed_at,
+                &reason_code,
+                &detail,
+            )?;
+            Ok(
+                if durable_provider_order_id == event_provider_order_id
+                    && reason_code == "TRANSPORT_BEFORE_SEND"
+                    && stored_attempt == *attempt_count
+                    && stored_evidence == *evidence_hash
+                    && computed_evidence == *evidence_hash
+                {
+                    CommitResolution::Committed
+                } else {
+                    CommitResolution::ConflictingEvidence
+                },
+            )
+        }
+        CommitRecoveryKey::CancelFinalization {
+            cancel_outbox_id,
+            terminal_state_event_id,
+            terminal_broker_event_id,
+            completion_reason,
+        } => {
+            let row = client
+                .query_opt(
+                    r#"
+SELECT
+    outbox.completed_at IS NOT NULL AS completed,
+    outbox.completion_reason,
+    event.state,
+    event.reason_code,
+    event.broker_event_id
+FROM public.cancel_outbox AS outbox
+LEFT JOIN public.cancel_state_events AS event
+  ON event.cancel_intent_id = outbox.cancel_intent_id
+ AND event.cancel_state_event_id = $2
+WHERE outbox.cancel_outbox_id = $1
+"#,
+                    &[cancel_outbox_id, terminal_state_event_id],
+                )
+                .await
+                .map_err(|error| StoreError::database("resolve_cancel_finalization", error))?;
+            let Some(row) = row else {
+                return Ok(CommitResolution::NotCommitted);
+            };
+            let completed: bool = row
+                .try_get("completed")
+                .map_err(|error| StoreError::database("decode_cancel_completed", error))?;
+            if !completed {
+                return Ok(CommitResolution::NotCommitted);
+            }
+            let stored_reason: Option<String> = row
+                .try_get("completion_reason")
+                .map_err(|error| StoreError::database("decode_cancel_completion_reason", error))?;
+            let state: Option<String> = row
+                .try_get("state")
+                .map_err(|error| StoreError::database("decode_cancel_terminal_state", error))?;
+            let event_reason: Option<String> = row
+                .try_get("reason_code")
+                .map_err(|error| StoreError::database("decode_cancel_terminal_reason", error))?;
+            let broker_event: Option<Uuid> = row
+                .try_get("broker_event_id")
+                .map_err(|error| StoreError::database("decode_cancel_terminal_broker", error))?;
+            Ok(
+                if stored_reason.as_deref() == Some(completion_reason.as_str())
+                    && state.as_deref() == Some("terminal")
+                    && event_reason.as_deref() == Some(completion_reason.as_str())
+                    && broker_event == Some(*terminal_broker_event_id)
+                {
+                    CommitResolution::Committed
+                } else {
+                    CommitResolution::ConflictingEvidence
+                },
+            )
+        }
     }
 }
 
@@ -3066,6 +4680,82 @@ const EXPECTED_SCHEMA_COLUMNS: &[ExpectedSchemaColumn] = &[
     column!("order_outbox", "created_fencing_token", "bigint", false),
     column!("order_outbox", "claim_fencing_token", "bigint", true),
     column!("order_outbox", "payload", "jsonb", false),
+    column!("cancel_intents", "cancel_intent_id", "uuid", false),
+    column!("cancel_intents", "intent_id", "uuid", false),
+    column!("cancel_intents", "client_order_id", "text", false),
+    column!("cancel_intents", "provider_order_id", "text", false),
+    column!("cancel_intents", "environment", "text", false),
+    column!("cancel_intents", "account_fingerprint", "text", false),
+    column!("cancel_intents", "reason_code", "text", false),
+    column!(
+        "cancel_intents",
+        "requested_at",
+        "timestamp with time zone",
+        false
+    ),
+    column!("cancel_intents", "created_fencing_token", "bigint", false),
+    column!(
+        "cancel_state_events",
+        "cancel_state_event_id",
+        "uuid",
+        false
+    ),
+    column!("cancel_state_events", "cancel_intent_id", "uuid", false),
+    column!("cancel_state_events", "event_sequence", "bigint", false),
+    column!("cancel_state_events", "state", "text", false),
+    column!("cancel_state_events", "reason_code", "text", false),
+    column!("cancel_state_events", "request_id", "text", true),
+    column!("cancel_state_events", "payload_hash", "text", true),
+    column!(
+        "cancel_state_events",
+        "not_dispatched_provider_order_id",
+        "text",
+        true
+    ),
+    column!(
+        "cancel_state_events",
+        "dispatch_attempt_count",
+        "integer",
+        true
+    ),
+    column!("cancel_state_events", "evidence_hash", "text", true),
+    column!("cancel_state_events", "broker_event_id", "uuid", true),
+    column!("cancel_state_events", "detail", "text", false),
+    column!("cancel_state_events", "fencing_token", "bigint", false),
+    column!(
+        "cancel_state_events",
+        "occurred_at",
+        "timestamp with time zone",
+        false
+    ),
+    column!("cancel_outbox", "cancel_outbox_id", "uuid", false),
+    column!("cancel_outbox", "cancel_intent_id", "uuid", false),
+    column!("cancel_outbox", "environment", "text", false),
+    column!("cancel_outbox", "account_fingerprint", "text", false),
+    column!("cancel_outbox", "created_fencing_token", "bigint", false),
+    column!("cancel_outbox", "claimed_by", "uuid", true),
+    column!(
+        "cancel_outbox",
+        "claimed_at",
+        "timestamp with time zone",
+        true
+    ),
+    column!("cancel_outbox", "claim_fencing_token", "bigint", true),
+    column!("cancel_outbox", "attempt_count", "integer", false),
+    column!("cancel_outbox", "payload", "jsonb", false),
+    column!(
+        "cancel_outbox",
+        "available_at",
+        "timestamp with time zone",
+        false
+    ),
+    column!(
+        "cancel_outbox",
+        "completed_at",
+        "timestamp with time zone",
+        true
+    ),
+    column!("cancel_outbox", "completion_reason", "text", true),
     column!("broker_orders", "broker_order_id", "text", false),
     column!("broker_order_events", "broker_event_id", "uuid", false),
     column!("broker_order_events", "event_sequence", "bigint", false),
@@ -3231,7 +4921,7 @@ mod tests {
 
     #[test]
     fn dispatch_and_recovery_use_distinct_server_authority_functions() {
-        assert!(CLAIM_FIRST_DISPATCH_SQL.contains("claim_order_outbox_v2("));
+        assert!(CLAIM_FIRST_DISPATCH_SQL.contains("claim_order_outbox_v3("));
         assert!(!CLAIM_FIRST_DISPATCH_SQL.contains("recovery"));
         assert!(CLAIM_RECOVERY_SQL.contains("claim_order_outbox_recovery_v2("));
         assert!(CLAIM_COMPLETION_SQL.contains("claim_order_outbox_completion_v2("));
@@ -3336,11 +5026,15 @@ mod tests {
         assert!(APPEND_SUBMISSION_UNKNOWN_SQL.contains("append_submission_unknown_v2"));
         assert!(LIST_UNRESOLVED_OUTBOXES_SQL.contains("list_unresolved_order_outboxes_v2"));
         let migration = include_str!("../../../migrations/0007_store_hardening.sql");
+        let cancellation = include_str!("../../../migrations/0008_durable_cancellation.sql");
         assert!(migration.contains("broker_order_events_require_fill_truth"));
         assert!(migration.contains("intent_state_events_require_terminal_fill_truth"));
         assert!(migration.contains("intent_state.state = 'terminal'"));
         assert!(!is_terminal_broker_status("accepted"));
         assert!(!is_terminal_broker_status("partially_filled"));
+        assert!(cancellation.contains("CANCEL_DISPATCH_STARTED"));
+        assert!(cancellation.contains("broker_state.broker_event_id = p_terminal_broker_event_id"));
+        assert!(cancellation.contains("REVOKE EXECUTE ON FUNCTION"));
     }
 
     #[test]
@@ -3353,6 +5047,90 @@ mod tests {
         assert_ne!(
             stable_child_uuid(parent, "state:persisted"),
             stable_child_uuid(parent, "outbox:intent-committed")
+        );
+    }
+
+    #[test]
+    fn cancellation_commit_evidence_uses_postgres_microsecond_precision() {
+        let raw = DateTime::parse_from_rfc3339("2026-07-19T12:34:56.123456789Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let stored = postgres_timestamp(raw).unwrap();
+        assert_eq!(stored.nanosecond(), 123_456_000);
+
+        let account = HashDigest::sha256(b"account");
+        let stored_payload = json!({"requested_at": stored});
+        let raw_payload = json!({"requested_at": raw});
+        let intent_write = cancel_intent_evidence_hash(
+            "client-order",
+            "provider-order",
+            "TEST_CANCEL",
+            stored,
+            Environment::Paper,
+            account,
+            7,
+            &stored_payload,
+        )
+        .unwrap();
+        let intent_recovered = cancel_intent_evidence_hash(
+            "client-order",
+            "provider-order",
+            "TEST_CANCEL",
+            stored,
+            Environment::Paper,
+            account,
+            7,
+            &stored_payload,
+        )
+        .unwrap();
+        assert_eq!(intent_write, intent_recovered);
+        assert_ne!(
+            intent_write,
+            cancel_intent_evidence_hash(
+                "client-order",
+                "provider-order",
+                "TEST_CANCEL",
+                raw,
+                Environment::Paper,
+                account,
+                7,
+                &raw_payload,
+            )
+            .unwrap()
+        );
+
+        let accepted = CancellationRequestAccepted {
+            provider_order_id: "provider-order".into(),
+            accepted_at: raw,
+            request_id: "request-id".into(),
+            raw_payload_hash: HashDigest::sha256(b"accepted response"),
+        };
+        let write_hash = cancel_accepted_evidence_hash(&accepted, stored, 7).unwrap();
+        let recovered_hash = cancel_accepted_evidence_parts(
+            &accepted.provider_order_id,
+            &accepted.request_id,
+            accepted.raw_payload_hash,
+            stored,
+            7,
+        )
+        .unwrap();
+        let unnormalized_hash = cancel_accepted_evidence_parts(
+            &accepted.provider_order_id,
+            &accepted.request_id,
+            accepted.raw_payload_hash,
+            raw,
+            7,
+        )
+        .unwrap();
+        assert_eq!(write_hash, recovered_hash);
+        assert_ne!(write_hash, unnormalized_hash);
+
+        let unknown_write = cancel_unknown_evidence_hash("bounded detail", 7, stored).unwrap();
+        let unknown_recovered = cancel_unknown_evidence_hash("bounded detail", 7, stored).unwrap();
+        assert_eq!(unknown_write, unknown_recovered);
+        assert_ne!(
+            unknown_write,
+            cancel_unknown_evidence_hash("bounded detail", 7, raw).unwrap()
         );
     }
 }

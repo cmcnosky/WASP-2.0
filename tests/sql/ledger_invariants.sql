@@ -582,6 +582,351 @@ INSERT INTO intent_state_events (
 
 DO $$
 DECLARE
+    v_requested_at TIMESTAMPTZ := clock_timestamp();
+    v_not_dispatched_at TIMESTAMPTZ;
+    v_accepted_at TIMESTAMPTZ;
+    v_rows INTEGER;
+    v_ready BOOLEAN;
+BEGIN
+    IF persist_cancel_intent_v2(
+        'paper', 'lease-test',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74600000-0000-0000-0000-000000000001',
+        '74700000-0000-0000-0000-000000000001',
+        '74800000-0000-0000-0000-000000000001',
+        '74800000-0000-0000-0000-000000000002',
+        'test-73000000000000000000000000000001',
+        'broker-confirmed-test', 'TEST_CANCEL_REQUEST', v_requested_at,
+        '{"command":"unbound-cancel"}'
+    ) OR EXISTS (
+        SELECT 1 FROM cancel_intents
+        WHERE cancel_intent_id = '74600000-0000-0000-0000-000000000001'
+    ) THEN
+        RAISE EXCEPTION 'unbound cancel payload created partial durable authority';
+    END IF;
+
+    IF NOT persist_cancel_intent_v2(
+        'paper', 'lease-test',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74600000-0000-0000-0000-000000000001',
+        '74700000-0000-0000-0000-000000000001',
+        '74800000-0000-0000-0000-000000000001',
+        '74800000-0000-0000-0000-000000000002',
+        'test-73000000000000000000000000000001',
+        'broker-confirmed-test', 'TEST_CANCEL_REQUEST', v_requested_at,
+        jsonb_build_object(
+            'cancel_intent_id', '74600000-0000-0000-0000-000000000001'::uuid,
+            'client_order_id', 'test-73000000000000000000000000000001',
+            'provider_order_id', 'broker-confirmed-test',
+            'reason_code', 'TEST_CANCEL_REQUEST',
+            'requested_at', v_requested_at
+        )
+    ) THEN
+        RAISE EXCEPTION 'durable cancellation intent/outbox did not commit atomically';
+    END IF;
+
+    IF NOT persist_cancel_intent_v2(
+        'paper', 'lease-test',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74600000-0000-0000-0000-000000000001',
+        '74700000-0000-0000-0000-000000000001',
+        '74800000-0000-0000-0000-000000000001',
+        '74800000-0000-0000-0000-000000000002',
+        'test-73000000000000000000000000000001',
+        'broker-confirmed-test', 'TEST_CANCEL_REQUEST', v_requested_at,
+        jsonb_build_object(
+            'cancel_intent_id', '74600000-0000-0000-0000-000000000001'::uuid,
+            'client_order_id', 'test-73000000000000000000000000000001',
+            'provider_order_id', 'broker-confirmed-test',
+            'reason_code', 'TEST_CANCEL_REQUEST',
+            'requested_at', v_requested_at
+        )
+    ) THEN
+        RAISE EXCEPTION 'exact cancellation persistence retry did not recover';
+    END IF;
+
+    IF persist_cancel_intent_v2(
+        'paper', 'lease-test',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74600000-0000-0000-0000-000000000001',
+        '74700000-0000-0000-0000-000000000001',
+        '74800000-0000-0000-0000-000000000001',
+        '74800000-0000-0000-0000-000000000002',
+        'test-73000000000000000000000000000001',
+        'broker-confirmed-test', 'CONFLICTING_CANCEL_REASON', v_requested_at,
+        jsonb_build_object(
+            'cancel_intent_id', '74600000-0000-0000-0000-000000000001'::uuid,
+            'client_order_id', 'test-73000000000000000000000000000001',
+            'provider_order_id', 'broker-confirmed-test',
+            'reason_code', 'CONFLICTING_CANCEL_REASON',
+            'requested_at', v_requested_at
+        )
+    ) THEN
+        RAISE EXCEPTION 'conflicting duplicate cancellation was accepted';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1
+    );
+    IF v_rows <> 1 OR NOT EXISTS (
+        SELECT 1 FROM current_cancel_states
+        WHERE cancel_intent_id = '74600000-0000-0000-0000-000000000001'
+          AND state = 'dispatch_started'
+    ) THEN
+        RAISE EXCEPTION 'cancel claim did not durably record dispatch before DELETE authority';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1
+    );
+    IF v_rows <> 0 THEN
+        RAISE EXCEPTION 'dispatched cancellation was authorized for a second DELETE';
+    END IF;
+
+    v_not_dispatched_at := clock_timestamp();
+    IF NOT append_cancel_not_dispatched_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74800000-0000-0000-0000-000000000010',
+        'broker-confirmed-test', 1, 'TRANSPORT_BEFORE_SEND',
+        'request budget denied before transport I/O', repeat('d', 64),
+        v_not_dispatched_at
+    ) OR NOT append_cancel_not_dispatched_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74800000-0000-0000-0000-000000000010',
+        'broker-confirmed-test', 1, 'TRANSPORT_BEFORE_SEND',
+        'request budget denied before transport I/O', repeat('d', 64),
+        v_not_dispatched_at
+    ) THEN
+        RAISE EXCEPTION 'proven pre-I/O non-dispatch was not durable and idempotent';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows
+    FROM list_unresolved_cancel_outboxes_v2(
+        'paper', 'lease-test',
+        '60000000-0000-0000-0000-000000000001', 1, 100
+    ) AS unresolved
+    WHERE unresolved.cancel_outbox_id = '74700000-0000-0000-0000-000000000001'
+      AND unresolved.current_state = 'not_dispatched'
+      AND unresolved.state_reason_code = 'TRANSPORT_BEFORE_SEND'
+      AND unresolved.state_not_dispatched_provider_order_id = 'broker-confirmed-test'
+      AND unresolved.state_dispatch_attempt_count = 1
+      AND unresolved.state_evidence_hash = repeat('d', 64)
+      AND unresolved.detail = 'request budget denied before transport I/O'
+      AND unresolved.terminal_broker_event_id IS NULL;
+    IF v_rows <> 1 THEN
+        RAISE EXCEPTION 'not-dispatched cancellation was not restart-discoverable with exact evidence';
+    END IF;
+
+    -- Exercise terminal completion directly from not_dispatched inside a
+    -- subtransaction, then roll the synthetic terminal truth back so the same
+    -- durable cancellation can continue through the retry-path checks below.
+    BEGIN
+        INSERT INTO broker_order_events (
+            broker_event_id, broker_order_id, client_order_id, provider_status,
+            recognized_status, cumulative_filled_quantity, average_fill_price,
+            provider_occurred_at, received_at, x_request_id, raw_payload, raw_hash
+        ) VALUES (
+            '74500000-0000-0000-0000-000000000020',
+            'broker-confirmed-test',
+            'test-73000000000000000000000000000001',
+            'canceled', TRUE, 0, NULL,
+            clock_timestamp(), clock_timestamp(), 'request-not-dispatched-terminal',
+            '{"status":"canceled","path":"not_dispatched"}', repeat('9', 64)
+        );
+        INSERT INTO intent_state_events (
+            intent_state_event_id, intent_id, state, reason_code,
+            detail, fencing_token, occurred_at
+        ) VALUES (
+            '73500000-0000-0000-0000-000000000020',
+            '73000000-0000-0000-0000-000000000001',
+            'terminal', 'TEST_NOT_DISPATCHED_TERMINAL', '{}', 1,
+            clock_timestamp()
+        );
+        SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_completion_v2(
+            'paper', 'lease-test',
+            '74700000-0000-0000-0000-000000000001',
+            '60000000-0000-0000-0000-000000000001', 1
+        );
+        IF v_rows <> 1 OR NOT finalize_cancel_outbox_v2(
+            'paper', 'lease-test',
+            '74700000-0000-0000-0000-000000000001',
+            '60000000-0000-0000-0000-000000000001', 1,
+            '74800000-0000-0000-0000-000000000020',
+            '74500000-0000-0000-0000-000000000020',
+            'BROKER_TERMINAL_CANCELED'
+        ) THEN
+            RAISE EXCEPTION 'not-dispatched cancellation did not permit terminal-only completion';
+        END IF;
+        RAISE EXCEPTION 'rollback-not-dispatched-terminal-proof';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'rollback-not-dispatched-terminal-proof' THEN
+                RAISE;
+            END IF;
+    END;
+    IF EXISTS (
+        SELECT 1 FROM broker_order_events
+        WHERE broker_event_id = '74500000-0000-0000-0000-000000000020'
+    ) OR NOT EXISTS (
+        SELECT 1 FROM current_cancel_states
+        WHERE cancel_intent_id = '74600000-0000-0000-0000-000000000001'
+          AND state = 'not_dispatched'
+          AND dispatch_attempt_count = 1
+    ) THEN
+        RAISE EXCEPTION 'not-dispatched terminal proof did not roll back cleanly';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_recovery_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1
+    );
+    IF v_rows <> 0 THEN
+        RAISE EXCEPTION 'not-dispatched cancellation incorrectly authorized lookup-only recovery';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_retry_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1
+    ) AS retry
+    WHERE retry.attempt_count = 2
+      AND retry.current_state = 'dispatch_started';
+    IF v_rows <> 1 THEN
+        RAISE EXCEPTION 'durable non-dispatch did not authorize exactly one retry attempt';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_retry_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1
+    );
+    IF v_rows <> 0 THEN
+        RAISE EXCEPTION 'retry dispatch marker authorized a second DELETE after a lost response';
+    END IF;
+
+    IF append_cancel_not_dispatched_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74800000-0000-0000-0000-000000000011',
+        'broker-confirmed-test', 1, 'TRANSPORT_BEFORE_SEND',
+        'stale worker evidence', repeat('e', 64), clock_timestamp()
+    ) OR EXISTS (
+        SELECT 1 FROM cancel_state_events
+        WHERE cancel_state_event_id = '74800000-0000-0000-0000-000000000011'
+    ) THEN
+        RAISE EXCEPTION 'stale dispatch attempt overwrote a newer retry marker';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_recovery_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1
+    );
+    IF v_rows <> 1 THEN
+        RAISE EXCEPTION 'lost retry-claim response did not fail closed to lookup-only recovery';
+    END IF;
+
+    v_accepted_at := clock_timestamp();
+    IF NOT append_cancel_request_accepted_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74800000-0000-0000-0000-000000000003',
+        'broker-confirmed-test', 'cancel-request-accepted', repeat('a', 64),
+        v_accepted_at
+    ) OR NOT append_cancel_request_accepted_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74800000-0000-0000-0000-000000000003',
+        'broker-confirmed-test', 'cancel-request-accepted', repeat('a', 64),
+        v_accepted_at
+    ) THEN
+        RAISE EXCEPTION 'cancel acceptance was not durable and idempotent';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_recovery_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1
+    );
+    IF v_rows <> 1 THEN
+        RAISE EXCEPTION 'accepted cancellation was not restart-recoverable';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows
+    FROM list_unresolved_cancel_outboxes_v2(
+        'paper', 'lease-test',
+        '60000000-0000-0000-0000-000000000001', 1, 100
+    ) AS unresolved
+    WHERE unresolved.cancel_outbox_id = '74700000-0000-0000-0000-000000000001'
+      AND unresolved.current_state = 'request_accepted'
+      AND unresolved.request_id = 'cancel-request-accepted';
+    SELECT ready INTO v_ready FROM execution_readiness_v2
+    WHERE environment = 'paper' AND account_fingerprint = 'lease-test';
+    IF v_rows <> 1 OR v_ready IS DISTINCT FROM FALSE THEN
+        RAISE EXCEPTION 'accepted cancellation was not blocking and discoverable';
+    END IF;
+
+    BEGIN
+        INSERT INTO cancel_state_events (
+            cancel_state_event_id, cancel_intent_id, state, reason_code,
+            broker_event_id, fencing_token, occurred_at
+        ) VALUES (
+            '74800000-0000-0000-0000-000000000099',
+            '74600000-0000-0000-0000-000000000001',
+            'terminal', 'ILLEGAL_ACK_TERMINAL',
+            '74500000-0000-0000-0000-000000000001', 1, clock_timestamp()
+        );
+        RAISE EXCEPTION 'nonterminal broker acknowledgement became terminal cancel truth';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'terminal cancel state lacks terminal broker truth' THEN
+                RAISE;
+            END IF;
+    END;
+
+    BEGIN
+        UPDATE cancel_outbox
+        SET completed_at = clock_timestamp(), completion_reason = 'ILLEGAL_ACK_TERMINAL'
+        WHERE cancel_outbox_id = '74700000-0000-0000-0000-000000000001';
+        RAISE EXCEPTION 'nonterminal cancellation outbox completed directly';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM <> 'cancel outbox completion lacks terminal cancel evidence' THEN
+                RAISE;
+            END IF;
+    END;
+
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_completion_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1
+    );
+    IF v_rows <> 0 OR finalize_cancel_outbox_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74800000-0000-0000-0000-000000000004',
+        '74500000-0000-0000-0000-000000000001', 'NONTERMINAL_ACK'
+    ) THEN
+        RAISE EXCEPTION '204 acceptance was incorrectly treated as terminal cancellation';
+    END IF;
+END;
+$$;
+
+DO $$
+DECLARE
     v_finalized BOOLEAN;
     v_rows INTEGER;
     v_ready BOOLEAN;
@@ -708,6 +1053,121 @@ BEGIN
     );
     IF NOT v_finalized THEN
         RAISE EXCEPTION 'current fenced executor could not finalize confirmed outbox item';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows
+    FROM list_unresolved_cancel_outboxes_v2(
+        'paper', 'lease-test',
+        '60000000-0000-0000-0000-000000000001', 1, 100
+    ) AS unresolved
+    WHERE unresolved.cancel_outbox_id = '74700000-0000-0000-0000-000000000001'
+      AND unresolved.current_state = 'request_accepted'
+      AND unresolved.terminal_broker_event_id = '74500000-0000-0000-0000-000000000002'
+      AND unresolved.terminal_provider_order_id = 'broker-confirmed-test'
+      AND unresolved.terminal_client_order_id = 'test-73000000000000000000000000000001'
+      AND unresolved.terminal_provider_status = 'canceled'
+      AND unresolved.terminal_recognized_status
+      AND unresolved.terminal_cumulative_filled_quantity::numeric = 0
+      AND unresolved.terminal_average_fill_price IS NULL
+      AND unresolved.terminal_provider_occurred_at = (
+          SELECT provider_occurred_at FROM broker_order_events
+          WHERE broker_event_id = '74500000-0000-0000-0000-000000000002'
+      )
+      AND unresolved.terminal_received_at = (
+          SELECT received_at FROM broker_order_events
+          WHERE broker_event_id = '74500000-0000-0000-0000-000000000002'
+      )
+      AND unresolved.terminal_request_id = 'request-test-2'
+      AND unresolved.terminal_raw_hash = repeat('0', 64);
+    IF v_rows <> 1 THEN
+        RAISE EXCEPTION 'restart discovery did not expose exact current terminal broker evidence';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1
+    );
+    IF v_rows <> 0 THEN
+        RAISE EXCEPTION 'terminal broker truth reauthorized first cancel dispatch';
+    END IF;
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_retry_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1
+    );
+    IF v_rows <> 0 THEN
+        RAISE EXCEPTION 'terminal broker truth reauthorized retry cancel dispatch';
+    END IF;
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_recovery_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1
+    );
+    IF v_rows <> 0 THEN
+        RAISE EXCEPTION 'terminal broker truth exposed lookup instead of completion-only work';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows
+    FROM claim_cancel_outbox_completion_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1
+    );
+    IF v_rows <> 1 THEN
+        RAISE EXCEPTION 'terminal broker truth did not expose cancel completion-only work';
+    END IF;
+
+    IF finalize_cancel_outbox_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74800000-0000-0000-0000-000000000098',
+        '74500000-0000-0000-0000-000000000002',
+        'BROKER_TERMINAL_FILLED'
+    ) OR EXISTS (
+        SELECT 1 FROM cancel_state_events
+        WHERE cancel_state_event_id = '74800000-0000-0000-0000-000000000098'
+    ) THEN
+        RAISE EXCEPTION 'cancel finalization accepted a reason mismatched to broker status';
+    END IF;
+
+    v_finalized := finalize_cancel_outbox_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74800000-0000-0000-0000-000000000004',
+        '74500000-0000-0000-0000-000000000002',
+        'BROKER_TERMINAL_CANCELED'
+    );
+    IF NOT v_finalized OR NOT finalize_cancel_outbox_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74800000-0000-0000-0000-000000000004',
+        '74500000-0000-0000-0000-000000000002',
+        'BROKER_TERMINAL_CANCELED'
+    ) THEN
+        RAISE EXCEPTION 'terminal cancel finalization was not durable and idempotent';
+    END IF;
+    IF finalize_cancel_outbox_v2(
+        'paper', 'lease-test',
+        '74700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001', 1,
+        '74800000-0000-0000-0000-000000000004',
+        '74500000-0000-0000-0000-000000000001',
+        'BROKER_TERMINAL_CANCELED'
+    ) OR EXISTS (
+        SELECT 1 FROM cancel_outbox
+        WHERE cancel_outbox_id = '74700000-0000-0000-0000-000000000001'
+          AND completed_at IS NULL
+    ) OR NOT EXISTS (
+        SELECT 1 FROM current_cancel_states
+        WHERE cancel_intent_id = '74600000-0000-0000-0000-000000000001'
+          AND state = 'terminal'
+          AND broker_event_id = '74500000-0000-0000-0000-000000000002'
+    ) THEN
+        RAISE EXCEPTION 'cancel completion was not bound to exact terminal broker evidence';
     END IF;
 
     v_finalized := finalize_order_outbox_v2(
@@ -874,6 +1334,12 @@ BEGIN
     IF has_table_privilege('alpaca_trader_runtime', 'order_intents', 'UPDATE') THEN
         RAISE EXCEPTION 'runtime role can rewrite an order intent';
     END IF;
+    IF has_table_privilege('alpaca_trader_runtime', 'cancel_intents', 'INSERT')
+       OR has_table_privilege('alpaca_trader_runtime', 'cancel_state_events', 'INSERT')
+       OR has_table_privilege('alpaca_trader_runtime', 'cancel_outbox', 'UPDATE')
+    THEN
+        RAISE EXCEPTION 'runtime role bypasses fenced cancellation functions';
+    END IF;
     IF has_column_privilege(
         'alpaca_trader_runtime', 'intent_state_events', 'event_sequence', 'INSERT'
     ) OR has_column_privilege(
@@ -913,6 +1379,33 @@ BEGIN
         'EXECUTE'
     ) THEN
         RAISE EXCEPTION 'runtime role retained unscoped recovery capability';
+    END IF;
+    IF NOT has_function_privilege(
+        'alpaca_trader_runtime',
+        'claim_order_outbox_v3(text,text,uuid,uuid,bigint)',
+        'EXECUTE'
+    ) OR has_function_privilege(
+        'alpaca_trader_runtime',
+        'claim_order_outbox_v2(text,text,uuid,uuid,bigint)',
+        'EXECUTE'
+    ) OR NOT has_function_privilege(
+        'alpaca_trader_runtime',
+        'persist_cancel_intent_v2(text,text,uuid,bigint,uuid,uuid,uuid,uuid,text,text,text,timestamp with time zone,jsonb)',
+        'EXECUTE'
+    ) OR NOT has_function_privilege(
+        'alpaca_trader_runtime',
+        'finalize_cancel_outbox_v2(text,text,uuid,uuid,bigint,uuid,uuid,text)',
+        'EXECUTE'
+    ) OR NOT has_function_privilege(
+        'alpaca_trader_runtime',
+        'claim_cancel_outbox_retry_v2(text,text,uuid,uuid,bigint)',
+        'EXECUTE'
+    ) OR NOT has_function_privilege(
+        'alpaca_trader_runtime',
+        'append_cancel_not_dispatched_v2(text,text,uuid,uuid,bigint,uuid,text,integer,text,text,text,timestamp with time zone)',
+        'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION 'runtime cancellation function allowlist drifted';
     END IF;
 END;
 $$;
@@ -959,9 +1452,10 @@ BEGIN
         RAISE EXCEPTION 'runtime safety-definition attestation mismatch count %', v_mismatches;
     END IF;
 
-    IF (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'function') < 39
-       OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'trigger') < 28
-       OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'constraint') < 106
+    IF (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'function') <> 54
+       OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'view') <> 3
+       OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'trigger') <> 34
+       OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'constraint') <> 139
     THEN
         RAISE EXCEPTION 'runtime safety-definition attestation is incomplete';
     END IF;
@@ -1023,6 +1517,26 @@ BEGIN
         current_user,
         'insert_order_intent_v2(text,text,uuid,bigint,uuid,uuid,uuid,uuid,text,text,text,bigint,numeric,text,timestamp with time zone,numeric,timestamp with time zone,timestamp with time zone,timestamp with time zone,text,text,text,timestamp with time zone)',
         'EXECUTE'
+    ) OR NOT has_function_privilege(
+        current_user,
+        'claim_order_outbox_v3(text,text,uuid,uuid,bigint)',
+        'EXECUTE'
+    ) OR NOT has_function_privilege(
+        current_user,
+        'append_cancel_unknown_v2(text,text,uuid,uuid,bigint,uuid,text,timestamp with time zone)',
+        'EXECUTE'
+    ) OR NOT has_function_privilege(
+        current_user,
+        'claim_cancel_outbox_retry_v2(text,text,uuid,uuid,bigint)',
+        'EXECUTE'
+    ) OR NOT has_function_privilege(
+        current_user,
+        'append_cancel_not_dispatched_v2(text,text,uuid,uuid,bigint,uuid,text,integer,text,text,text,timestamp with time zone)',
+        'EXECUTE'
+    ) OR has_function_privilege(
+        current_user,
+        'claim_order_outbox_v2(text,text,uuid,uuid,bigint)',
+        'EXECUTE'
     ) OR has_function_privilege(
         current_user,
         'claim_order_outbox(uuid,uuid,bigint)',
@@ -1080,6 +1594,8 @@ DECLARE
     v_provider_at TIMESTAMPTZ;
     v_received_at TIMESTAMPTZ;
     v_valid_until TIMESTAMPTZ;
+    v_cancel_requested_at TIMESTAMPTZ;
+    v_cancel_unknown_at TIMESTAMPTZ;
     v_started_at TIMESTAMPTZ;
     v_snapshot_at TIMESTAMPTZ;
     v_rows INTEGER;
@@ -1159,7 +1675,7 @@ BEGIN
         RAISE EXCEPTION 'runtime execution-chain wrapper returned false';
     END IF;
 
-    SELECT COUNT(*) INTO v_rows FROM claim_order_outbox_v2(
+    SELECT COUNT(*) INTO v_rows FROM claim_order_outbox_v3(
         'paper', 'lease-test', '84000000-0000-0000-0000-000000000001',
         '60000000-0000-0000-0000-000000000002', 2
     );
@@ -1180,6 +1696,82 @@ BEGIN
         'broker-wrapper-test', '83000000-0000-0000-0000-000000000001',
         'test-83000000000000000000000000000001', clock_timestamp(), repeat('9', 64)
     );
+    v_ok := v_ok AND insert_broker_event_v2(
+        'paper', 'lease-test', '60000000-0000-0000-0000-000000000002', 2,
+        '84500000-0000-0000-0000-000000000000', 'broker-wrapper-test',
+        'test-83000000000000000000000000000001', 'accepted', TRUE, 0, NULL,
+        clock_timestamp(), clock_timestamp(), 'wrapper-request-accepted',
+        '{"status":"accepted"}', repeat('1', 64)
+    );
+    v_ok := v_ok AND insert_intent_state_v2(
+        'paper', 'lease-test', '60000000-0000-0000-0000-000000000002', 2,
+        '83500000-0000-0000-0000-000000000004',
+        '83000000-0000-0000-0000-000000000001',
+        'broker_confirmed', 'TEST_BROKER_CONFIRMED', '{}', clock_timestamp()
+    );
+    IF NOT v_ok THEN
+        RAISE EXCEPTION 'runtime accepted broker wrapper returned false';
+    END IF;
+
+    v_cancel_requested_at := clock_timestamp();
+    IF NOT persist_cancel_intent_v2(
+        'paper', 'lease-test', '60000000-0000-0000-0000-000000000002', 2,
+        '84600000-0000-0000-0000-000000000001',
+        '84700000-0000-0000-0000-000000000001',
+        '84800000-0000-0000-0000-000000000001',
+        '84800000-0000-0000-0000-000000000002',
+        'test-83000000000000000000000000000001', 'broker-wrapper-test',
+        'TEST_RUNTIME_CANCEL_UNKNOWN', v_cancel_requested_at,
+        jsonb_build_object(
+            'cancel_intent_id', '84600000-0000-0000-0000-000000000001'::uuid,
+            'client_order_id', 'test-83000000000000000000000000000001',
+            'provider_order_id', 'broker-wrapper-test',
+            'reason_code', 'TEST_RUNTIME_CANCEL_UNKNOWN',
+            'requested_at', v_cancel_requested_at
+        )
+    ) THEN
+        RAISE EXCEPTION 'runtime could not durably persist cancellation before DELETE';
+    END IF;
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_v2(
+        'paper', 'lease-test', '84700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000002', 2
+    );
+    IF v_rows <> 1 THEN
+        RAISE EXCEPTION 'runtime could not claim cancellation dispatch once';
+    END IF;
+    v_cancel_unknown_at := clock_timestamp();
+    IF NOT append_cancel_unknown_v2(
+        'paper', 'lease-test', '84700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000002', 2,
+        '84800000-0000-0000-0000-000000000003',
+        'http timeout after cancel request write', v_cancel_unknown_at
+    ) OR NOT append_cancel_unknown_v2(
+        'paper', 'lease-test', '84700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000002', 2,
+        '84800000-0000-0000-0000-000000000003',
+        'http timeout after cancel request write', v_cancel_unknown_at
+    ) THEN
+        RAISE EXCEPTION 'runtime cancel unknown was not durable and idempotent';
+    END IF;
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_recovery_v2(
+        'paper', 'lease-test', '84700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000002', 2
+    );
+    IF v_rows <> 1 THEN
+        RAISE EXCEPTION 'cancel unknown was not restart-recoverable without redispatch';
+    END IF;
+    SELECT COUNT(*) INTO v_rows
+    FROM list_unresolved_cancel_outboxes_v2(
+        'paper', 'lease-test',
+        '60000000-0000-0000-0000-000000000002', 2, 100
+    ) AS unresolved
+    WHERE unresolved.cancel_outbox_id = '84700000-0000-0000-0000-000000000001'
+      AND unresolved.current_state = 'cancel_unknown'
+      AND unresolved.detail = 'http timeout after cancel request write';
+    IF v_rows <> 1 THEN
+        RAISE EXCEPTION 'cancel unknown was not restart-discoverable with exact evidence';
+    END IF;
+
     v_ok := v_ok AND insert_fill_v2(
         'paper', 'lease-test', '60000000-0000-0000-0000-000000000002', 2,
         'wrapper-fill-1', 'broker-wrapper-test',
@@ -1195,18 +1787,25 @@ BEGIN
     );
     v_ok := v_ok AND insert_intent_state_v2(
         'paper', 'lease-test', '60000000-0000-0000-0000-000000000002', 2,
-        '83500000-0000-0000-0000-000000000004',
-        '83000000-0000-0000-0000-000000000001',
-        'broker_confirmed', 'TEST_BROKER_CONFIRMED', '{}', clock_timestamp()
-    );
-    v_ok := v_ok AND insert_intent_state_v2(
-        'paper', 'lease-test', '60000000-0000-0000-0000-000000000002', 2,
         '83500000-0000-0000-0000-000000000005',
         '83000000-0000-0000-0000-000000000001',
         'terminal', 'TEST_TERMINAL', '{}', clock_timestamp()
     );
     IF NOT v_ok THEN
         RAISE EXCEPTION 'runtime broker/fill wrapper returned false';
+    END IF;
+    SELECT COUNT(*) INTO v_rows FROM claim_cancel_outbox_completion_v2(
+        'paper', 'lease-test', '84700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000002', 2
+    );
+    IF v_rows <> 1 OR NOT finalize_cancel_outbox_v2(
+        'paper', 'lease-test', '84700000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000002', 2,
+        '84800000-0000-0000-0000-000000000004',
+        '84500000-0000-0000-0000-000000000001',
+        'BROKER_TERMINAL_FILLED'
+    ) THEN
+        RAISE EXCEPTION 'runtime could not finalize unknown cancel from terminal broker truth';
     END IF;
     SELECT COUNT(*) INTO v_rows FROM claim_order_outbox_completion_v2(
         'paper', 'lease-test', '84000000-0000-0000-0000-000000000001',
