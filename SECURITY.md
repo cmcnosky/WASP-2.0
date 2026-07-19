@@ -48,6 +48,12 @@ Production tasks have no public IP, inbound listener, SSH path, or load balancer
 The task role is distinct from the ECS execution role and receives least-privilege
 access to its own buckets, metrics, and secrets.
 
+While the runtime entrypoint is incomplete, the GitHub OIDC role is an image
+publisher only. Its policy explicitly denies ECS task/service deployment and
+`iam:PassRole`, so a compromised CI identity cannot turn a pushed image into a
+credential-bearing task. Removing those denies is a separately reviewed
+promotion change, not an operator variable or approval-string action.
+
 ## Supply chain
 
 - Commit Rust and Python lockfiles and deploy only immutable container digests.

@@ -58,7 +58,22 @@ pub struct ReqwestTransport {
     client: Client,
     credentials: Credentials,
     request_budget: Arc<Mutex<RequestBudget>>,
-    arrival_guard: CertifiedBrokerArrivalGuard,
+    access: TransportAccess,
+}
+
+/// Reqwest-backed transport whose public type can perform only GET requests.
+///
+/// This is the transport type for startup and reconciliation processes that
+/// have no authority to mutate broker state. POST and DELETE are rejected by
+/// the transport before request construction, authentication-header
+/// injection, budget acquisition, or network I/O.
+pub struct ReadOnlyReqwestTransport {
+    inner: ReqwestTransport,
+}
+
+enum TransportAccess {
+    MutationCapable(CertifiedBrokerArrivalGuard),
+    ReadOnly,
 }
 
 /// A bounded broker-arrival allowance derived from an observed p99 plus an
@@ -165,8 +180,17 @@ impl ReqwestTransport {
             client,
             credentials,
             request_budget: Arc::clone(&ACCOUNT_REQUEST_BUDGET),
-            arrival_guard,
+            access: TransportAccess::MutationCapable(arrival_guard),
         })
+    }
+
+    fn read_only(credentials: Credentials, client: Client) -> Self {
+        Self {
+            client,
+            credentials,
+            request_budget: Arc::clone(&ACCOUNT_REQUEST_BUDGET),
+            access: TransportAccess::ReadOnly,
+        }
     }
 
     /// Converts and validates a request without performing network I/O.
@@ -237,6 +261,34 @@ impl ReqwestTransport {
             .try_acquire(class, Instant::now())
             .map_err(|_| before_send("HTTP request budget denied dispatch"))
     }
+
+    fn validate_method_access(&self, method: HttpMethod) -> Result<(), TransportError> {
+        match (&self.access, method) {
+            (TransportAccess::ReadOnly, HttpMethod::Post | HttpMethod::Delete) => Err(before_send(
+                "read-only HTTP transport prohibits broker mutations",
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    fn arrival_guard(&self) -> Option<&CertifiedBrokerArrivalGuard> {
+        match &self.access {
+            TransportAccess::MutationCapable(arrival_guard) => Some(arrival_guard),
+            TransportAccess::ReadOnly => None,
+        }
+    }
+}
+
+impl ReadOnlyReqwestTransport {
+    /// Builds a credential-bearing client that is mechanically restricted to
+    /// GET requests and therefore needs no submission-arrival certificate.
+    pub fn from_env() -> Result<Self, TransportError> {
+        let credentials = Credentials::from_env()?;
+        let client = build_client()?;
+        Ok(Self {
+            inner: ReqwestTransport::read_only(credentials, client),
+        })
+    }
 }
 
 #[async_trait]
@@ -249,24 +301,29 @@ impl HttpTransport for ReqwestTransport {
         validate_dispatch_deadline(
             HttpMethod::Post,
             Some(broker_arrival_by),
-            &self.arrival_guard,
+            self.arrival_guard(),
             now,
         )
     }
 
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+        // This capability check must remain the first operation. In read-only
+        // mode it prevents mutation requests from reaching validation that
+        // constructs a request or injects credential headers, consumes budget,
+        // or performs network I/O.
+        self.validate_method_access(request.method)?;
         // The class is explicit contract data. Never infer cancellation or
         // reconciliation priority from a URL or HTTP method.
         let request_class = request.request_class;
         let method = request.method;
         let not_after = request.not_after;
-        validate_dispatch_deadline(method, not_after, &self.arrival_guard, Utc::now())?;
+        validate_dispatch_deadline(method, not_after, self.arrival_guard(), Utc::now())?;
         let mut request = self.prepare_request(request)?;
         self.acquire_budget(request_class)?;
         // Recheck after request construction and budget acquisition, at the
         // last application-controlled point before reqwest may write bytes.
         let response_timeout =
-            response_timeout(method, not_after, &self.arrival_guard, Utc::now())?;
+            response_timeout(method, not_after, self.arrival_guard(), Utc::now())?;
         *request.timeout_mut() = response_timeout;
 
         let mut response = self
@@ -311,6 +368,23 @@ impl HttpTransport for ReqwestTransport {
             body,
             received_at,
         })
+    }
+}
+
+#[async_trait]
+impl HttpTransport for ReadOnlyReqwestTransport {
+    fn validate_broker_arrival_window(
+        &self,
+        _broker_arrival_by: DateTime<Utc>,
+        _now: DateTime<Utc>,
+    ) -> Result<(), TransportError> {
+        Err(before_send(
+            "read-only HTTP transport prohibits broker submissions",
+        ))
+    }
+
+    async fn send(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+        self.inner.send(request).await
     }
 }
 
@@ -379,13 +453,15 @@ fn validate_url(raw: &str) -> Result<Url, TransportError> {
 fn validate_dispatch_deadline(
     method: HttpMethod,
     not_after: Option<chrono::DateTime<Utc>>,
-    arrival_guard: &CertifiedBrokerArrivalGuard,
+    arrival_guard: Option<&CertifiedBrokerArrivalGuard>,
     now: chrono::DateTime<Utc>,
 ) -> Result<(), TransportError> {
     match (method, not_after) {
         (HttpMethod::Post, Some(deadline))
             if now < deadline && deadline - now <= chrono::Duration::seconds(15) =>
         {
+            let arrival_guard = arrival_guard
+                .ok_or_else(|| before_send("POST requires a certified broker-arrival guard"))?;
             let dispatch_by = arrival_guard.dispatch_by(deadline, now)?;
             if now < dispatch_by {
                 Ok(())
@@ -408,7 +484,7 @@ fn validate_dispatch_deadline(
 fn response_timeout(
     method: HttpMethod,
     not_after: Option<chrono::DateTime<Utc>>,
-    arrival_guard: &CertifiedBrokerArrivalGuard,
+    arrival_guard: Option<&CertifiedBrokerArrivalGuard>,
     now: chrono::DateTime<Utc>,
 ) -> Result<Option<Duration>, TransportError> {
     validate_dispatch_deadline(method, not_after, arrival_guard, now)?;
@@ -567,7 +643,23 @@ mod tests {
                     .expect("test request budget should be valid"),
             )
             .into(),
-            arrival_guard: test_arrival_guard(now),
+            access: TransportAccess::MutationCapable(test_arrival_guard(now)),
+        }
+    }
+
+    fn test_read_only_transport() -> ReadOnlyReqwestTransport {
+        ReadOnlyReqwestTransport {
+            inner: ReqwestTransport {
+                client: build_client().expect("test client should build"),
+                credentials: Credentials::from_values("test-key-id".into(), "test-secret".into())
+                    .expect("test credentials should be valid headers"),
+                request_budget: Mutex::new(
+                    RequestBudget::new(REQUEST_LIMIT_PER_MINUTE, REQUEST_SAFETY_RESERVE)
+                        .expect("test request budget should be valid"),
+                )
+                .into(),
+                access: TransportAccess::ReadOnly,
+            },
         }
     }
 
@@ -653,6 +745,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn read_only_transport_rejects_mutations_before_request_processing_or_budget() {
+        let transport = test_read_only_transport();
+        let requests_before = lock_budget(&transport.inner.request_budget)
+            .unwrap()
+            .in_window();
+
+        for method in [HttpMethod::Post, HttpMethod::Delete] {
+            let mut mutation = request("https://api.alpaca.markets/v2/orders");
+            mutation.method = method;
+            mutation.body = vec![0; MAX_REQUEST_BODY_BYTES + 1];
+            mutation
+                .headers
+                .insert(API_KEY_ID_HEADER.into(), "caller-value".into());
+
+            let result = transport.send(mutation).await;
+
+            assert!(matches!(
+                result,
+                Err(TransportError::BeforeSend { detail })
+                    if detail == "read-only HTTP transport prohibits broker mutations"
+            ));
+        }
+
+        assert_eq!(
+            lock_budget(&transport.inner.request_budget)
+                .unwrap()
+                .in_window(),
+            requests_before,
+            "read-only mutation rejection must not consume request budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_gets_need_no_broker_arrival_certificate() {
+        let transport = test_read_only_transport();
+        let now = Utc::now();
+
+        assert!(validate_dispatch_deadline(HttpMethod::Get, None, None, now).is_ok());
+        assert!(matches!(
+            transport
+                .send(request("https://api.alpaca.markets/v2/account"))
+                .await,
+            Err(TransportError::BeforeSend { detail })
+                if detail == "request URL host is not allowlisted"
+        ));
+        assert!(matches!(
+            transport.validate_broker_arrival_window(now + chrono::Duration::seconds(5), now),
+            Err(TransportError::BeforeSend { detail })
+                if detail == "read-only HTTP transport prohibits broker submissions"
+        ));
+    }
+
     #[test]
     fn injected_auth_headers_are_sensitive() {
         let transport = test_transport();
@@ -709,11 +854,11 @@ mod tests {
         assert!(transport.prepare_request(post.clone()).is_ok());
         let now = Utc::now();
         let guard = test_arrival_guard(now);
-        assert!(validate_dispatch_deadline(post.method, None, &guard, now).is_err());
+        assert!(validate_dispatch_deadline(post.method, None, Some(&guard), now).is_err());
         assert!(validate_dispatch_deadline(
             post.method,
             Some(now - chrono::Duration::nanoseconds(1)),
-            &guard,
+            Some(&guard),
             now
         )
         .is_err());
@@ -721,7 +866,7 @@ mod tests {
         let remaining = response_timeout(
             post.method,
             Some(now + chrono::Duration::seconds(2)),
-            &guard,
+            Some(&guard),
             now,
         )
         .unwrap()
@@ -730,14 +875,14 @@ mod tests {
         assert!(validate_dispatch_deadline(
             post.method,
             Some(now + chrono::Duration::seconds(15)),
-            &guard,
+            Some(&guard),
             now
         )
         .is_ok());
         assert!(validate_dispatch_deadline(
             post.method,
             Some(now + chrono::Duration::seconds(16)),
-            &guard,
+            Some(&guard),
             now
         )
         .is_err());
@@ -747,14 +892,17 @@ mod tests {
         assert!(validate_dispatch_deadline(
             post.method,
             Some(arrival_by),
-            &guard,
+            Some(&guard),
             dispatch_by - chrono::Duration::nanoseconds(1),
         )
         .is_ok());
-        assert!(
-            validate_dispatch_deadline(post.method, Some(arrival_by), &guard, dispatch_by,)
-                .is_err()
-        );
+        assert!(validate_dispatch_deadline(
+            post.method,
+            Some(arrival_by),
+            Some(&guard),
+            dispatch_by,
+        )
+        .is_err());
     }
 
     #[test]
@@ -788,7 +936,7 @@ mod tests {
         assert!(validate_dispatch_deadline(
             HttpMethod::Post,
             Some(now + chrono::Duration::seconds(5)),
-            &expired,
+            Some(&expired),
             now,
         )
         .is_err());

@@ -257,6 +257,16 @@ resource "aws_ecs_task_definition" "app" {
     }
 
     precondition {
+      condition     = local.deployment_is_paper_read_only
+      error_message = "deploy_application is currently restricted to paper read-only reconciliation."
+    }
+
+    precondition {
+      condition     = local.deployment_has_observer_entrypoint
+      error_message = "deploy_application remains blocked until the image contains a tested long-running paper observer entrypoint."
+    }
+
+    precondition {
       condition     = local.mutation_has_runtime
       error_message = "Broker mutation mode cannot be requested while the application task is disabled."
     }
@@ -381,29 +391,22 @@ data "aws_iam_policy_document" "github_release" {
     resources = [aws_ecr_repository.app.arn]
   }
 
+  # CI may publish an immutable image, but it cannot start or replace a task
+  # while the runtime entrypoint and reconciliation gates remain incomplete.
+  # The explicit deny also wins if a broader allow is accidentally attached.
   statement {
-    sid    = "RegisterAndDeployTask"
-    effect = "Allow"
+    sid    = "HoldAllApplicationDeployment"
+    effect = "Deny"
     actions = [
-      "ecs:DescribeServices",
-      "ecs:DescribeTaskDefinition",
+      "ecs:CreateService",
+      "ecs:ExecuteCommand",
       "ecs:RegisterTaskDefinition",
-      "ecs:UpdateService"
+      "ecs:RunTask",
+      "ecs:StartTask",
+      "ecs:UpdateService",
+      "iam:PassRole"
     ]
     resources = ["*"]
-  }
-
-  statement {
-    sid       = "PassExactTaskRoles"
-    effect    = "Allow"
-    actions   = ["iam:PassRole"]
-    resources = [aws_iam_role.app.arn, aws_iam_role.ecs_execution.arn]
-
-    condition {
-      test     = "StringEquals"
-      variable = "iam:PassedToService"
-      values   = ["ecs-tasks.amazonaws.com"]
-    }
   }
 }
 

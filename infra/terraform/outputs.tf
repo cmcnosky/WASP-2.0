@@ -54,7 +54,7 @@ output "alert_topic_arn" {
 }
 
 output "github_release_role_arn" {
-  description = "Environment-scoped GitHub OIDC release identity."
+  description = "Environment-scoped GitHub OIDC image-publishing identity; ECS deployment and PassRole are explicitly denied."
   value       = aws_iam_role.github_release.arn
 }
 

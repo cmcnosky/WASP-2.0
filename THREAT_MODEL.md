@@ -32,6 +32,7 @@ reconciliation are required.
 | Threat | Primary controls | Failure behavior |
 |---|---|---|
 | Stolen broker/cloud credential | Secrets Manager/KMS, OIDC, least privilege, rotation, redaction | Hard halt, revoke, reconcile |
+| Compromised CI image-publishing identity | While deployment is on HOLD, the OIDC role can publish only to the environment ECR repository and explicitly denies ECS start/update/register operations and `iam:PassRole` | Cannot deploy a task; revoke trust and quarantine images |
 | Paper process reaches live broker | Fixed endpoint derived from environment; separate account/VPC/role/secret/state | Startup refuses mismatch |
 | Duplicate executor/order | One desired task, stop-before-start deployment, PostgreSQL lease/fence, deterministic client order ID | Reconcile-only |
 | Lost or timed-out submission response | Durable intent before submit; lookup by client order ID | `SUBMISSION_UNKNOWN`; no retry |

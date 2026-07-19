@@ -237,6 +237,78 @@ run "ca_placeholder_blocks_deployment_plan" {
   expect_failures = [aws_ecs_task_definition.app]
 }
 
+run "paper_observer_entrypoint_missing_blocks_plan" {
+  command = plan
+
+  variables {
+    environment                   = "paper"
+    expected_aws_account_id       = "111111111111"
+    database_name                 = "alpaca_autotrader_paper"
+    rds_ca_cert_identifier        = "rds-ca-rsa2048-g1"
+    expected_rds_ca_bundle_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+    github_repository             = "owner/repository"
+    container_image_digest        = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    execution_mode                = "read_only"
+    deploy_application            = true
+    runtime_ready_approval_id     = "runtime-approved"
+    alert_email                   = null
+    create_account_budget         = false
+  }
+
+  expect_failures = [aws_ecs_task_definition.app]
+}
+
+run "live_read_only_deployment_blocks_plan" {
+  command = plan
+
+  override_data {
+    target = data.aws_caller_identity.current
+    values = {
+      account_id = "222222222222"
+      arn        = "arn:aws:iam::222222222222:user/terraform-test"
+      user_id    = "terraform-test"
+    }
+  }
+
+  variables {
+    environment                   = "live"
+    expected_aws_account_id       = "222222222222"
+    database_name                 = "alpaca_autotrader_live"
+    rds_ca_cert_identifier        = "rds-ca-rsa2048-g1"
+    expected_rds_ca_bundle_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+    github_repository             = "owner/repository"
+    container_image_digest        = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    execution_mode                = "read_only"
+    deploy_application            = true
+    runtime_ready_approval_id     = "runtime-approved"
+    alert_email                   = "operator@example.invalid"
+    create_account_budget         = true
+  }
+
+  expect_failures = [aws_ecs_task_definition.app]
+}
+
+run "paper_mutation_deployment_blocks_plan" {
+  command = plan
+
+  variables {
+    environment                   = "paper"
+    expected_aws_account_id       = "111111111111"
+    database_name                 = "alpaca_autotrader_paper"
+    rds_ca_cert_identifier        = "rds-ca-rsa2048-g1"
+    expected_rds_ca_bundle_sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+    github_repository             = "owner/repository"
+    container_image_digest        = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    execution_mode                = "paper"
+    deploy_application            = true
+    runtime_ready_approval_id     = "runtime-approved"
+    alert_email                   = null
+    create_account_budget         = false
+  }
+
+  expect_failures = [aws_ecs_task_definition.app]
+}
+
 run "unsupported_fargate_pair_blocks_plan" {
   command = plan
 

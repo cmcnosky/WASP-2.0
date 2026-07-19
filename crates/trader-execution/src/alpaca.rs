@@ -31,12 +31,14 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration, NaiveDate, SecondsFormat, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use trader_core::{
-    AccountSnapshot, BrokerEvent, Environment, Fixed, FreshExecutionQuote, HashDigest, Money,
-    OrderIntent, OrderSide, Price, Symbol, TimeInForce, WholeQuantity,
+    AccountSnapshot, AccountStatus, BrokerEvent, Environment, Fixed, FreshExecutionQuote,
+    HashDigest, Money, OrderIntent, OrderSide, Price, Symbol, TimeInForce, WholeQuantity,
 };
 
 use crate::{
     config::{MARKET_DATA_API, PAPER_TRADING_API},
+    coordinator::{BrokerSnapshot, CoordinatorPortError, OrderTruth, ReadOnlyBroker},
+    lifecycle::BrokerOrderStatus,
     port::{
         BrokerPort, CancellationNotDispatched, CancellationOutcome, CancellationRequestAccepted,
         RegularTradingSessionPermit, SubmissionOutcome,
@@ -52,6 +54,8 @@ const MAX_ERROR_MESSAGE_BYTES: usize = 256;
 const MAX_QUOTE_TTL_SECONDS: i64 = 15;
 const MAX_QUOTE_SOURCE_AGE_SECONDS: i64 = 15;
 const MAX_CLOCK_SOURCE_AGE_SECONDS: i64 = 15;
+const MIN_ACCOUNT_FINGERPRINT_SALT_BYTES: usize = 32;
+const MAX_ACCOUNT_FINGERPRINT_SALT_BYTES: usize = 1_024;
 const US_EQUITY_MARKET: &str = "NYSE";
 const US_EQUITY_TIMEZONE: &str = "America/New_York";
 const ORDER_PAGE_SIZE: usize = 500;
@@ -216,7 +220,9 @@ impl AlpacaAccount {
     /// Produces a non-reversible, installation-specific account identity.
     /// The salt belongs in the caller's secret store and must not be logged.
     pub fn account_fingerprint(&self, salt: &[u8]) -> Result<HashDigest, ExecutionError> {
-        if !(32..=1_024).contains(&salt.len()) {
+        if !(MIN_ACCOUNT_FINGERPRINT_SALT_BYTES..=MAX_ACCOUNT_FINGERPRINT_SALT_BYTES)
+            .contains(&salt.len())
+        {
             return Err(ExecutionError::UnsafeConfiguration(
                 "account fingerprint salt must contain 32 through 1024 bytes".into(),
             ));
@@ -228,7 +234,9 @@ impl AlpacaAccount {
         material.extend_from_slice(&(salt.len() as u64).to_be_bytes());
         material.extend_from_slice(salt);
         material.extend_from_slice(self.provider_account_id.as_bytes());
-        Ok(HashDigest::sha256(material))
+        let fingerprint = HashDigest::sha256(&material);
+        material.fill(0);
+        Ok(fingerprint)
     }
 
     pub fn is_trade_eligible(&self) -> bool {
@@ -416,6 +424,42 @@ pub struct AlpacaMarketCalendar {
 pub struct AlpacaPaperAdapter<T> {
     transport: T,
     environment: Environment,
+}
+
+/// Narrow broker port for startup reconciliation. It owns the full adapter but
+/// deliberately exposes no submit, replace, cancel, transport, or salt access.
+/// This type intentionally implements neither `Debug` nor `Serialize`.
+pub struct AlpacaReadOnlyBroker<T> {
+    adapter: AlpacaPaperAdapter<T>,
+    fingerprint_salt: FingerprintSalt,
+}
+
+/// Secret account-identity material. No formatting or serialization trait is
+/// implemented, and the bytes are overwritten before ordinary deallocation.
+struct FingerprintSalt(Vec<u8>);
+
+impl Drop for FingerprintSalt {
+    fn drop(&mut self) {
+        self.0.fill(0);
+    }
+}
+
+impl<T> AlpacaReadOnlyBroker<T> {
+    pub fn new(
+        adapter: AlpacaPaperAdapter<T>,
+        mut fingerprint_salt: Vec<u8>,
+    ) -> Result<Self, CoordinatorPortError> {
+        if !(MIN_ACCOUNT_FINGERPRINT_SALT_BYTES..=MAX_ACCOUNT_FINGERPRINT_SALT_BYTES)
+            .contains(&fingerprint_salt.len())
+        {
+            fingerprint_salt.fill(0);
+            return Err(read_only_configuration_error());
+        }
+        Ok(Self {
+            adapter,
+            fingerprint_salt: FingerprintSalt(fingerprint_salt),
+        })
+    }
 }
 
 impl<T> AlpacaPaperAdapter<T> {
@@ -620,6 +664,17 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
             .into_iter()
             .map(AlpacaPosition::try_from)
             .collect::<Result<Vec<_>, _>>()?;
+        let mut provider_asset_ids = BTreeSet::new();
+        let mut symbols = BTreeSet::new();
+        for position in &positions {
+            if !provider_asset_ids.insert(position.provider_asset_id.clone())
+                || !symbols.insert(position.symbol.clone())
+            {
+                return Err(ExecutionError::Broker(
+                    "positions response repeated a provider asset or symbol".into(),
+                ));
+            }
+        }
         Ok(Observed {
             value: positions,
             evidence,
@@ -890,6 +945,17 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
                 .into_iter()
                 .map(FillActivity::try_from)
                 .collect::<Result<Vec<_>, _>>()?;
+            if query
+                .after
+                .is_some_and(|after| page.iter().any(|fill| fill.transaction_at <= after))
+                || query
+                    .until
+                    .is_some_and(|until| page.iter().any(|fill| fill.transaction_at >= until))
+            {
+                return Err(ExecutionError::Broker(
+                    "FILL activity response violated its exclusive timestamp bounds".into(),
+                ));
+            }
             validate_ascending_fill_page(&page, previous_page_tail)?;
             if page_token
                 .as_ref()
@@ -1253,6 +1319,124 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
     }
 }
 
+impl<T: HttpTransport> AlpacaReadOnlyBroker<T> {
+    async fn collect_snapshot(&self) -> Result<BrokerSnapshot, ExecutionError> {
+        let account = self.adapter.get_account().await?;
+        let account_fingerprint = account
+            .value
+            .account_fingerprint(&self.fingerprint_salt.0)?;
+        let account_created_at = account.value.created_at;
+
+        let positions = self.adapter.get_positions().await?;
+        let open_orders = self.adapter.list_open_orders().await?;
+        let closed_orders = self
+            .adapter
+            .list_recent_closed_orders(account_created_at)
+            .await?;
+        let fills = self
+            .adapter
+            .list_fill_activities(&FillActivityQuery {
+                after: Some(account_created_at),
+                ..FillActivityQuery::default()
+            })
+            .await?;
+
+        if !open_orders.completeness_proven()
+            || !closed_orders.completeness_proven()
+            || !fills.completeness_proven()
+        {
+            return Err(ExecutionError::Broker(
+                "read-only broker pagination was not complete".into(),
+            ));
+        }
+
+        let mut normalized_positions = BTreeMap::new();
+        for position in positions.value {
+            if normalized_positions
+                .insert(position.symbol, position.quantity)
+                .is_some()
+            {
+                return Err(ExecutionError::Broker(
+                    "read-only broker snapshot repeated a position symbol".into(),
+                ));
+            }
+        }
+
+        let mut provider_order_ids = BTreeSet::new();
+        let mut client_order_ids = BTreeSet::new();
+        let mut orders = BTreeMap::new();
+        normalize_snapshot_orders(
+            open_orders.value,
+            &mut provider_order_ids,
+            &mut client_order_ids,
+            &mut orders,
+        )?;
+        normalize_snapshot_orders(
+            closed_orders.value,
+            &mut provider_order_ids,
+            &mut client_order_ids,
+            &mut orders,
+        )?;
+
+        let mut fill_fingerprints = fills
+            .value
+            .iter()
+            .map(fill_fingerprint)
+            .collect::<Result<Vec<_>, _>>()?;
+        fill_fingerprints.sort_unstable();
+
+        let mut source_evidence_hashes = Vec::with_capacity(
+            2 + open_orders.page_evidence.len()
+                + closed_orders.page_evidence.len()
+                + fills.page_evidence.len(),
+        );
+        source_evidence_hashes.push(account.evidence.raw_payload_hash);
+        source_evidence_hashes.push(positions.evidence.raw_payload_hash);
+        source_evidence_hashes.extend(
+            open_orders
+                .page_evidence
+                .into_iter()
+                .map(|evidence| evidence.raw_payload_hash),
+        );
+        source_evidence_hashes.extend(
+            closed_orders
+                .page_evidence
+                .into_iter()
+                .map(|evidence| evidence.raw_payload_hash),
+        );
+        source_evidence_hashes.extend(
+            fills
+                .page_evidence
+                .into_iter()
+                .map(|evidence| evidence.raw_payload_hash),
+        );
+
+        Ok(BrokerSnapshot {
+            account_fingerprint,
+            account_status: map_account_status(&account.value.status),
+            trading_blocked: account.value.trading_blocked,
+            account_blocked: account.value.account_blocked,
+            transfers_blocked: account.value.transfers_blocked,
+            trade_suspended_by_user: account.value.trade_suspended_by_user,
+            usd_currency: account.value.currency == "USD",
+            cash: account.value.cash,
+            positions: normalized_positions,
+            orders,
+            fill_fingerprints,
+            source_evidence_hashes,
+        })
+    }
+}
+
+#[async_trait]
+impl<T: HttpTransport> ReadOnlyBroker for AlpacaReadOnlyBroker<T> {
+    async fn read_snapshot(&mut self) -> Result<BrokerSnapshot, CoordinatorPortError> {
+        self.collect_snapshot()
+            .await
+            .map_err(|_| read_only_snapshot_error())
+    }
+}
+
 /// The order operations satisfy the existing executor port. Account snapshots
 /// intentionally fail closed because Alpaca's account endpoint does not expose
 /// the certified high-water drawdown required by `AccountSnapshot`; a local
@@ -1570,11 +1754,7 @@ impl TryFrom<RawAccount> for AlpacaAccount {
         validate_bounded_text("account id", &raw.id, MAX_IDENTIFIER_BYTES)?;
         validate_bounded_text("account number", &raw.account_number, MAX_IDENTIFIER_BYTES)?;
         validate_bounded_text("account status", &raw.status, MAX_IDENTIFIER_BYTES)?;
-        if raw.currency != "USD" {
-            return Err(ExecutionError::Broker(
-                "account currency is not the required USD".into(),
-            ));
-        }
+        validate_bounded_text("account currency", &raw.currency, 16)?;
         Ok(Self {
             provider_account_id: raw.id,
             account_number: raw.account_number,
@@ -1870,6 +2050,111 @@ struct CreateOrderRequest<'a> {
     extended_hours: bool,
     client_order_id: &'a str,
     order_class: &'static str,
+}
+
+#[derive(Serialize)]
+struct FillFingerprintMaterial<'a> {
+    schema: &'static str,
+    activity_id: &'a str,
+    activity_type: &'a str,
+    fill_type: &'a str,
+    provider_order_id: &'a str,
+    symbol: &'a Symbol,
+    side: OrderSide,
+    quantity: WholeQuantity,
+    cumulative_quantity: WholeQuantity,
+    leaves_quantity: WholeQuantity,
+    price: Price,
+    transaction_at: DateTime<Utc>,
+}
+
+fn normalize_snapshot_orders(
+    orders: Vec<AlpacaOrder>,
+    provider_order_ids: &mut BTreeSet<String>,
+    client_order_ids: &mut BTreeSet<String>,
+    normalized_orders: &mut BTreeMap<String, OrderTruth>,
+) -> Result<(), ExecutionError> {
+    for order in orders {
+        if matches!(
+            BrokerOrderStatus::from_provider(&order.status),
+            BrokerOrderStatus::Unknown(_)
+        ) {
+            return Err(ExecutionError::Broker(
+                "read-only broker snapshot contained an unknown order status".into(),
+            ));
+        }
+        if !provider_order_ids.insert(order.provider_order_id.clone())
+            || !client_order_ids.insert(order.client_order_id.clone())
+        {
+            return Err(ExecutionError::Broker(
+                "read-only broker snapshot repeated an order identity".into(),
+            ));
+        }
+        let client_order_id = order.client_order_id.clone();
+        let truth = OrderTruth {
+            provider_order_id: order.provider_order_id,
+            client_order_id: order.client_order_id,
+            symbol: order.symbol,
+            asset_class: order.asset_class,
+            side: order.side,
+            quantity: order.quantity,
+            notional: order.notional,
+            filled_quantity: order.filled_quantity,
+            average_fill_price: order.average_fill_price,
+            limit_price: order.limit_price,
+            order_class: order.order_class,
+            order_type: order.order_type,
+            time_in_force: order.time_in_force,
+            status: order.status,
+            extended_hours: order.extended_hours,
+            submitted_at: order.submitted_at,
+            updated_at: order.updated_at,
+        };
+        if normalized_orders.insert(client_order_id, truth).is_some() {
+            return Err(ExecutionError::Broker(
+                "read-only broker snapshot repeated an order identity".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn fill_fingerprint(fill: &FillActivity) -> Result<HashDigest, ExecutionError> {
+    HashDigest::of_json(&FillFingerprintMaterial {
+        schema: "wasp2/alpaca-fill-fingerprint/v1",
+        activity_id: &fill.activity_id,
+        activity_type: &fill.activity_type,
+        fill_type: &fill.fill_type,
+        provider_order_id: &fill.provider_order_id,
+        symbol: &fill.symbol,
+        side: fill.side,
+        quantity: fill.quantity,
+        cumulative_quantity: fill.cumulative_quantity,
+        leaves_quantity: fill.leaves_quantity,
+        price: fill.price,
+        transaction_at: fill.transaction_at,
+    })
+    .map_err(|_| ExecutionError::Broker("fill fingerprint could not be computed".into()))
+}
+
+fn map_account_status(status: &str) -> AccountStatus {
+    match status {
+        "ACTIVE" => AccountStatus::Active,
+        "ACCOUNT_CLOSED" | "CLOSED" | "REJECTED" => AccountStatus::Closed,
+        "ACCOUNT_UPDATED" | "ACTION_REQUIRED" | "APPROVAL_PENDING" | "APPROVED" | "INACTIVE"
+        | "ONBOARDING" | "RESTRICTED" | "SUBMISSION_FAILED" | "SUBMITTED" => {
+            AccountStatus::Restricted
+        }
+        _ => AccountStatus::Unknown,
+    }
+}
+
+fn read_only_configuration_error() -> CoordinatorPortError {
+    CoordinatorPortError::new("read-only Alpaca broker configuration rejected")
+}
+
+fn read_only_snapshot_error() -> CoordinatorPortError {
+    CoordinatorPortError::new("read-only Alpaca broker snapshot unavailable")
 }
 
 fn validate_intent(intent: &OrderIntent) -> Result<(), ExecutionError> {
@@ -2388,6 +2673,47 @@ mod tests {
         })
     }
 
+    fn account_json(status: &str, currency: &str) -> Value {
+        json!({
+            "id": "account-1",
+            "account_number": "PA123",
+            "status": status,
+            "currency": currency,
+            "cash": "1000.25",
+            "buying_power": "1000.25",
+            "non_marginable_buying_power": "900",
+            "equity": "1100.25",
+            "last_equity": "1090.25",
+            "portfolio_value": "1100.25",
+            "long_market_value": "100",
+            "short_market_value": "0",
+            "accrued_fees": "0",
+            "pending_transfer_in": "0",
+            "pending_transfer_out": "0",
+            "initial_margin": "0",
+            "maintenance_margin": "0",
+            "last_maintenance_margin": "0",
+            "regt_buying_power": "1000.25",
+            "multiplier": "1",
+            "trading_blocked": false,
+            "transfers_blocked": false,
+            "account_blocked": false,
+            "trade_suspended_by_user": false,
+            "shorting_enabled": false,
+            "created_at": "2026-07-01T00:00:00Z"
+        })
+    }
+
+    fn position_json() -> Value {
+        json!({
+            "asset_id": "asset-1", "symbol": "SPY", "exchange": "ARCA",
+            "asset_class": "us_equity", "avg_entry_price": "500", "qty": "2",
+            "qty_available": "2", "side": "long", "market_value": "1000",
+            "cost_basis": "1000", "unrealized_pl": "0", "unrealized_intraday_pl": "0",
+            "current_price": "500", "lastday_price": "499"
+        })
+    }
+
     fn full_fill_page(prefix: &str, transaction_time: &str, page_size: usize) -> Value {
         Value::Array(
             (0..page_size)
@@ -2577,6 +2903,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_broker_builds_complete_normalized_snapshot() {
+        let account_body = account_json("ACTIVE", "USD");
+        let positions_body = json!([position_json()]);
+        let open_orders_body = json!([order_json("new")]);
+        let mut closed_order = order_json("filled");
+        closed_order["id"] = json!("order-2");
+        closed_order["client_order_id"] = json!("client-2");
+        closed_order["filled_qty"] = json!("2");
+        closed_order["filled_avg_price"] = json!("500.10");
+        closed_order["submitted_at"] = json!("2026-07-19T13:30:00Z");
+        closed_order["updated_at"] = json!("2026-07-19T13:31:00Z");
+        let closed_orders_body = json!([closed_order]);
+        let fills_body = json!([fill_json("fill-1", "2026-07-19T13:31:00Z")]);
+        let response_bodies = [
+            account_body.clone(),
+            positions_body.clone(),
+            open_orders_body.clone(),
+            closed_orders_body.clone(),
+            fills_body.clone(),
+        ];
+        let expected_evidence = response_bodies
+            .iter()
+            .map(|body| HashDigest::sha256(serde_json::to_vec(body).unwrap()))
+            .collect::<Vec<_>>();
+        let transport = FakeTransport::with_outcomes(
+            response_bodies
+                .into_iter()
+                .map(|body| Ok(response(200, body)))
+                .collect(),
+        );
+        let mut broker = AlpacaReadOnlyBroker::new(adapter(transport.clone()), vec![9_u8; 32])
+            .expect("valid secret salt should construct the narrow port");
+
+        let snapshot = broker.read_snapshot().await.unwrap();
+
+        assert_eq!(snapshot.account_status, AccountStatus::Active);
+        assert!(snapshot.usd_currency);
+        assert_eq!(snapshot.cash, "1000.25".parse().unwrap());
+        assert_eq!(
+            snapshot.positions,
+            BTreeMap::from([(Symbol::new("SPY").unwrap(), WholeQuantity::new(2))])
+        );
+        assert_eq!(snapshot.orders.len(), 2);
+        assert_eq!(snapshot.orders["client-1"].status, "new");
+        assert_eq!(snapshot.orders["client-1"].symbol.as_str(), "SPY");
+        assert_eq!(
+            snapshot.orders["client-1"].quantity,
+            Some(WholeQuantity::new(2))
+        );
+        assert_eq!(snapshot.orders["client-2"].status, "filled");
+        assert_eq!(snapshot.fill_fingerprints.len(), 1);
+        assert_eq!(snapshot.source_evidence_hashes, expected_evidence);
+        assert_ne!(
+            snapshot.account_fingerprint,
+            HashDigest::sha256("account-1")
+        );
+
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 5);
+        assert!(requests
+            .iter()
+            .all(|request| request.method == HttpMethod::Get));
+        assert!(requests[2].url.contains("status=open"));
+        assert!(requests[3].url.contains("status=closed"));
+        assert!(requests[3].url.contains("after=2026-07-01T00%3A00%3A00Z"));
+        assert!(requests[4].url.contains("/activities/FILL"));
+        assert!(requests[4].url.contains("after=2026-07-01T00%3A00%3A00Z"));
+    }
+
+    #[tokio::test]
+    async fn read_only_broker_preserves_account_restrictions_and_non_usd_state() {
+        let mut account = account_json("APPROVAL_PENDING", "EUR");
+        account["trading_blocked"] = json!(true);
+        account["transfers_blocked"] = json!(true);
+        account["account_blocked"] = json!(true);
+        account["trade_suspended_by_user"] = json!(true);
+        let transport = FakeTransport::with_outcomes(vec![
+            Ok(response(200, account)),
+            Ok(response(200, json!([]))),
+            Ok(response(200, json!([]))),
+            Ok(response(200, json!([]))),
+            Ok(response(200, json!([]))),
+        ]);
+        let mut broker = AlpacaReadOnlyBroker::new(adapter(transport), vec![6_u8; 32]).unwrap();
+
+        let snapshot = broker.read_snapshot().await.unwrap();
+
+        assert_eq!(snapshot.account_status, AccountStatus::Restricted);
+        assert!(snapshot.trading_blocked);
+        assert!(snapshot.transfers_blocked);
+        assert!(snapshot.account_blocked);
+        assert!(snapshot.trade_suspended_by_user);
+        assert!(!snapshot.usd_currency);
+    }
+
+    #[tokio::test]
+    async fn read_only_broker_rejects_unknown_and_duplicate_order_identities_redacted() {
+        let mut unknown = order_json("future_provider_state");
+        unknown["id"] = json!("unknown-order");
+        let unknown_transport = FakeTransport::with_outcomes(vec![
+            Ok(response(200, account_json("ACTIVE", "USD"))),
+            Ok(response(200, json!([]))),
+            Ok(response(200, json!([unknown]))),
+            Ok(response(200, json!([]))),
+            Ok(response(200, json!([]))),
+        ]);
+        let mut unknown_broker =
+            AlpacaReadOnlyBroker::new(adapter(unknown_transport), vec![7_u8; 32]).unwrap();
+
+        let unknown_error = unknown_broker.read_snapshot().await.unwrap_err();
+
+        assert_eq!(
+            unknown_error.to_string(),
+            "read-only Alpaca broker snapshot unavailable"
+        );
+        assert!(!unknown_error.to_string().contains("future_provider_state"));
+
+        let first = order_json("new");
+        let mut duplicate_client = order_json("accepted");
+        duplicate_client["id"] = json!("order-2");
+        let duplicate_transport = FakeTransport::with_outcomes(vec![
+            Ok(response(200, account_json("ACTIVE", "USD"))),
+            Ok(response(200, json!([]))),
+            Ok(response(200, json!([first, duplicate_client]))),
+            Ok(response(200, json!([]))),
+            Ok(response(200, json!([]))),
+        ]);
+        let mut duplicate_broker =
+            AlpacaReadOnlyBroker::new(adapter(duplicate_transport), vec![8_u8; 32]).unwrap();
+
+        let duplicate_error = duplicate_broker.read_snapshot().await.unwrap_err();
+
+        assert_eq!(
+            duplicate_error.to_string(),
+            "read-only Alpaca broker snapshot unavailable"
+        );
+    }
+
+    #[test]
+    fn read_only_broker_rejects_invalid_salt_with_fixed_error() {
+        let result =
+            AlpacaReadOnlyBroker::new(adapter(FakeTransport::default()), b"short".to_vec());
+        let error = match result {
+            Ok(_) => panic!("short salt must not construct the broker port"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "read-only Alpaca broker configuration rejected"
+        );
+        assert!(!error.to_string().contains("short"));
+    }
+
+    #[tokio::test]
     async fn positions_reject_fractional_or_short_provider_state() {
         let fractional = json!([{
             "asset_id": "asset-1", "symbol": "SPY", "exchange": "ARCA",
@@ -2599,6 +3080,28 @@ mod tests {
         let adapter = adapter(transport);
         assert!(adapter.get_positions().await.is_err());
         assert!(adapter.get_positions().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn positions_reject_duplicate_provider_assets_or_symbols() {
+        let first = json!({
+            "asset_id": "asset-1", "symbol": "SPY", "exchange": "ARCA",
+            "asset_class": "us_equity", "avg_entry_price": "500", "qty": "1",
+            "qty_available": "1", "side": "long", "market_value": "500",
+            "cost_basis": "500", "unrealized_pl": "0", "unrealized_intraday_pl": "0",
+            "current_price": "500", "lastday_price": "499"
+        });
+        let same_symbol = json!({
+            "asset_id": "asset-2", "symbol": "SPY", "exchange": "ARCA",
+            "asset_class": "us_equity", "avg_entry_price": "500", "qty": "1",
+            "qty_available": "1", "side": "long", "market_value": "500",
+            "cost_basis": "500", "unrealized_pl": "0", "unrealized_intraday_pl": "0",
+            "current_price": "500", "lastday_price": "499"
+        });
+        let transport =
+            FakeTransport::with_outcomes(vec![Ok(response(200, json!([first, same_symbol])))]);
+
+        assert!(adapter(transport).get_positions().await.is_err());
     }
 
     #[tokio::test]
@@ -2800,6 +3303,35 @@ mod tests {
             transport.requests()[0].url,
             "https://paper-api.alpaca.markets/v2/account/activities/FILL?direction=asc&page_size=100&page_token=prior%3A%3Aactivity"
         );
+    }
+
+    #[tokio::test]
+    async fn fill_activity_response_must_obey_exclusive_timestamp_bounds() {
+        let boundary = "2026-07-20T13:30:00Z".parse().unwrap();
+        let body = json!([fill_json(
+            "20260720000000000::fill-1",
+            "2026-07-20T13:30:00Z"
+        )]);
+        let transport = FakeTransport::with_outcomes(vec![
+            Ok(response(200, body.clone())),
+            Ok(response(200, body)),
+        ]);
+        let adapter = adapter(transport);
+
+        assert!(adapter
+            .list_fill_activities(&FillActivityQuery {
+                after: Some(boundary),
+                ..FillActivityQuery::default()
+            })
+            .await
+            .is_err());
+        assert!(adapter
+            .list_fill_activities(&FillActivityQuery {
+                until: Some(boundary),
+                ..FillActivityQuery::default()
+            })
+            .await
+            .is_err());
     }
 
     #[tokio::test]

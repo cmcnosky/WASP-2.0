@@ -1,5 +1,11 @@
 # Deployment and rollback
 
+**Current status: HOLD — this runbook is not executable yet.** Terraform blocks
+application deployment, and the GitHub OIDC role explicitly denies ECS
+deployment and `iam:PassRole`, until the long-running read-only observer and its
+failure-path evidence exist. The steps below describe the later approved flow;
+an approval ID alone cannot open the current hold.
+
 ## Preconditions
 
 - CI is green for the immutable commit and image digest.
