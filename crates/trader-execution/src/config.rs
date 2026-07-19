@@ -70,6 +70,39 @@ impl RuntimeConfig {
         }
         Ok(())
     }
+
+    /// Validate the only runtime configuration currently permitted to start
+    /// the paper reconciliation coordinator.
+    ///
+    /// This is intentionally narrower than [`Self::validate`]: the general
+    /// validator continues to describe future shadow, paper-mutation, and live
+    /// configurations, while startup must remain exactly paper/read-only until
+    /// those later modes earn separate authority.
+    pub fn validate_paper_read_only_startup(&self) -> Result<(), ExecutionError> {
+        self.validate()?;
+
+        if self.environment != Environment::Paper {
+            return Err(ExecutionError::UnsafeConfiguration(
+                "startup runtime is restricted to the paper environment".into(),
+            ));
+        }
+        if self.submission_enabled {
+            return Err(ExecutionError::UnsafeConfiguration(
+                "paper startup runtime must remain read-only".into(),
+            ));
+        }
+        if self
+            .credentials_secret_arn
+            .as_deref()
+            .is_none_or(|secret_arn| secret_arn.trim().is_empty())
+        {
+            return Err(ExecutionError::UnsafeConfiguration(
+                "paper startup reconciliation requires a secret reference".into(),
+            ));
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -110,5 +143,56 @@ mod tests {
         let mut live = config(Environment::Live);
         live.database_isolation_tag = "paper".into();
         assert!(live.validate().is_err());
+    }
+
+    #[test]
+    fn exact_paper_read_only_startup_configuration_is_accepted() {
+        let mut paper = config(Environment::Paper);
+        paper.submission_enabled = false;
+
+        assert_eq!(paper.validate_paper_read_only_startup(), Ok(()));
+    }
+
+    #[test]
+    fn startup_configuration_rejects_non_paper_environments() {
+        for environment in [Environment::Shadow, Environment::Live] {
+            let mut candidate = config(environment);
+            candidate.submission_enabled = false;
+
+            assert_eq!(
+                candidate.validate_paper_read_only_startup(),
+                Err(ExecutionError::UnsafeConfiguration(
+                    "startup runtime is restricted to the paper environment".into()
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn startup_configuration_rejects_paper_submission_authority() {
+        let paper = config(Environment::Paper);
+
+        assert_eq!(
+            paper.validate_paper_read_only_startup(),
+            Err(ExecutionError::UnsafeConfiguration(
+                "paper startup runtime must remain read-only".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn startup_configuration_requires_non_blank_secret_reference() {
+        for secret_reference in [None, Some(String::new()), Some("   ".into())] {
+            let mut paper = config(Environment::Paper);
+            paper.submission_enabled = false;
+            paper.credentials_secret_arn = secret_reference;
+
+            assert_eq!(
+                paper.validate_paper_read_only_startup(),
+                Err(ExecutionError::UnsafeConfiguration(
+                    "paper startup reconciliation requires a secret reference".into()
+                ))
+            );
+        }
     }
 }

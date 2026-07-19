@@ -37,6 +37,17 @@ locals {
     !var.deploy_application ||
     try(length(trimspace(var.runtime_ready_approval_id)), 0) >= 8
   )
+  deployment_is_paper_read_only = (
+    !var.deploy_application ||
+    (var.environment == "paper" && var.execution_mode == "read_only")
+  )
+  # Keep deployment mechanically unavailable until the binary has a tested,
+  # long-running observer entrypoint. An approval reference cannot substitute
+  # for code that does not yet exist.
+  observer_entrypoint_is_implemented = false
+  deployment_has_observer_entrypoint = (
+    !var.deploy_application || local.observer_entrypoint_is_implemented
+  )
   mutation_has_runtime = var.execution_mode == "read_only" || var.deploy_application
   deployment_has_real_ca_digest = (
     !var.deploy_application ||

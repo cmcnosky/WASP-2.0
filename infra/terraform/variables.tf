@@ -143,7 +143,7 @@ variable "execution_mode" {
 }
 
 variable "deploy_application" {
-  description = "Start the ECS task only after a real long-running reconcile loop is implemented and approved."
+  description = "Reserved paper read-only deployment switch; currently blocked until the long-running observer entrypoint is implemented and tested."
   type        = bool
   default     = false
 }

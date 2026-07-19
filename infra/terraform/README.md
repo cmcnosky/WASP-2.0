@@ -31,7 +31,8 @@ process. Infrastructure/database alarms remain active.
   secrets. The task cannot read the RDS master secret.
 - CloudWatch/SNS safety alarms, ECS-stop event, and independent EventBridge/
   Lambda dead-man check with telemetry permissions only.
-- Environment-scoped GitHub OIDC release role and optional dedicated-account
+- Environment-scoped GitHub OIDC image-publishing role with explicit ECS
+  deployment and `iam:PassRole` denies, plus an optional dedicated-account
   monthly budget.
 
 The baseline uses one NAT gateway in paper and two in live. Before live, price
@@ -98,18 +99,19 @@ different GitHub environments and protection rules. If both stacks temporarily
 share an AWS account, pass the existing GitHub provider ARN to the second stack;
 every other named resource and state still remains distinct.
 
-Live starts with `execution_mode=read_only` for at least five reconciled trading
-sessions. Switching to `live` requires the runbook, complete readiness evidence,
-an immutable image/release, and `live_activation_approval_id`. Returning the
-Terraform variable to read-only does not replace the application kill path or
-manual Alpaca emergency access.
+The current Terraform revision cannot deploy an application task: the task
+precondition is closed and the GitHub OIDC role may publish images but is
+explicitly denied ECS deployment and `iam:PassRole`. A later reviewed code
+change must remove both holds only after the observer entrypoint is implemented
+and tested. Live would then start in read-only for at least five reconciled
+trading sessions; mutation still requires the complete live-readiness runbook.
 
 ## Validation and drills
 
 `../../scripts/check-infra.sh` runs format, init-without-backend, validation, two
-valid stopped-environment plans, and ten negative mocked plans that prove the
-account, environment/execution, activation, runtime, CA digest, Fargate,
-database-name, alert, and budget preconditions block unsafe plans. Before live
+valid stopped-environment plans, and thirteen negative mocked plans that prove
+the account, environment/execution, activation, runtime/entrypoint, CA digest,
+Fargate, database-name, alert, and budget preconditions block unsafe plans. Before live
 authority, complete and record task-kill, deployment rollback, RDS failover,
 PITR restore, credential rotation, alert delivery, dead-man, and region
 benchmark drills. Always recover into reconcile-only.

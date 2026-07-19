@@ -6,6 +6,7 @@
 pub mod alpaca;
 pub mod authority;
 pub mod config;
+pub mod coordinator;
 pub mod database;
 pub mod executor;
 pub mod http_transport;
