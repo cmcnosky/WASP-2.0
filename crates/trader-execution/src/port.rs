@@ -6,10 +6,82 @@ use trader_core::{AccountSnapshot, BrokerEvent, HashDigest, OrderIntent};
 use crate::ExecutionError;
 
 const MAX_SESSION_PERMIT_AGE_SECONDS: i64 = 15;
+pub const MAX_SUBMISSION_RESPONSE_JSON_BYTES: usize = 64 * 1024;
+
+/// Exact provider response evidence for a successfully observed submission.
+///
+/// The raw JSON bytes are retained verbatim rather than reconstructed from the
+/// typed event. That allows the durable coordinator to persist the provider
+/// payload whose hash is already carried by [`BrokerEvent`]. Construction
+/// validates both a strict size ceiling and the payload hash so an
+/// implementation cannot accidentally join an event to different evidence.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ObservedBrokerOrder {
+    event: BrokerEvent,
+    raw_response_json: Vec<u8>,
+}
+
+impl ObservedBrokerOrder {
+    pub fn try_new(event: BrokerEvent, raw_response_json: Vec<u8>) -> Result<Self, ExecutionError> {
+        if raw_response_json.is_empty()
+            || raw_response_json.len() > MAX_SUBMISSION_RESPONSE_JSON_BYTES
+        {
+            return Err(ExecutionError::Broker(
+                "observed broker-order response JSON is empty or exceeds its byte ceiling".into(),
+            ));
+        }
+        let raw_value: serde_json::Value =
+            serde_json::from_slice(&raw_response_json).map_err(|_| {
+                ExecutionError::Broker("observed broker-order response is not JSON".into())
+            })?;
+        if !raw_value.is_object() {
+            return Err(ExecutionError::Broker(
+                "observed broker-order response JSON is not an object".into(),
+            ));
+        }
+        if HashDigest::sha256(&raw_response_json) != event.raw_payload_hash {
+            return Err(ExecutionError::Broker(
+                "observed broker-order event does not match its raw response hash".into(),
+            ));
+        }
+        Ok(Self {
+            event,
+            raw_response_json,
+        })
+    }
+
+    pub fn event(&self) -> &BrokerEvent {
+        &self.event
+    }
+
+    pub fn raw_response_json(&self) -> &[u8] {
+        &self.raw_response_json
+    }
+
+    pub fn into_parts(self) -> (BrokerEvent, Vec<u8>) {
+        (self.event, self.raw_response_json)
+    }
+}
+
+/// Local transport evidence proving that a submission never began broker I/O.
+/// A future durable coordinator may authorize a retry only after recording
+/// this exact attempt; this transient value alone never authorizes another
+/// POST.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SubmissionNotDispatched {
+    pub client_order_id: String,
+    pub observed_at: DateTime<Utc>,
+    pub reason_code: String,
+    pub detail: String,
+    pub evidence_hash: HashDigest,
+}
 
 #[derive(Clone, Eq, PartialEq)]
 pub enum SubmissionOutcome {
-    Observed(BrokerEvent),
+    Observed(ObservedBrokerOrder),
+    /// The transport proved that it rejected the request before any I/O. A
+    /// retry requires a separate durable state transition and fresh authority.
+    NotDispatched(SubmissionNotDispatched),
     /// The request may have reached the broker. Callers must persist
     /// SUBMISSION_UNKNOWN and query by the identical client_order_id.
     Unknown {
@@ -192,7 +264,7 @@ pub trait BrokerPort: Send + Sync {
     async fn find_order_by_client_id(
         &self,
         expected_intent: &OrderIntent,
-    ) -> Result<Option<BrokerEvent>, ExecutionError>;
+    ) -> Result<Option<ObservedBrokerOrder>, ExecutionError>;
     /// Reconciliation-only lookup for a cancellation whose DELETE may already
     /// have reached the broker. Implementations must validate both provider and
     /// client identities and must never turn this read into another DELETE.

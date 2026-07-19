@@ -1264,6 +1264,7 @@ impl ExecutionStore for PgExecutionStore {
                 "submission-unknown reason must contain 1 through 128 bytes".into(),
             ));
         }
+        let occurred_at = postgres_timestamp(occurred_at)?;
         let environment = environment_sql(lease.environment);
         let account = lease.account_fingerprint.as_hex();
         let token = positive_i64(lease.fencing_token, "submission-unknown fencing_token")?;
@@ -5051,7 +5052,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_commit_evidence_uses_postgres_microsecond_precision() {
+    fn commit_evidence_uses_postgres_microsecond_precision() {
         let raw = DateTime::parse_from_rfc3339("2026-07-19T12:34:56.123456789Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -5131,6 +5132,20 @@ mod tests {
         assert_ne!(
             unknown_write,
             cancel_unknown_evidence_hash("bounded detail", 7, raw).unwrap()
+        );
+
+        let submission_detail = json!({"detail": "timeout"});
+        let submission_write =
+            submission_unknown_evidence_hash("SUBMISSION_UNKNOWN", &submission_detail, 7, stored)
+                .unwrap();
+        let submission_recovered =
+            submission_unknown_evidence_hash("SUBMISSION_UNKNOWN", &submission_detail, 7, stored)
+                .unwrap();
+        assert_eq!(submission_write, submission_recovered);
+        assert_ne!(
+            submission_write,
+            submission_unknown_evidence_hash("SUBMISSION_UNKNOWN", &submission_detail, 7, raw,)
+                .unwrap()
         );
     }
 }

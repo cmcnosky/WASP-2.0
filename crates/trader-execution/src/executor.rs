@@ -377,7 +377,8 @@ impl<B: BrokerPort> Executor<B> {
             .submit_committed_intent(&intent, session_permit, not_after)
             .await
         {
-            Ok(SubmissionOutcome::Observed(event)) => {
+            Ok(SubmissionOutcome::Observed(observed)) => {
+                let (event, _raw_response_json) = observed.into_parts();
                 if let Err(error) =
                     append_validated_broker_event(ledger, &intent.client_order_id, event, now)
                 {
@@ -400,6 +401,26 @@ impl<B: BrokerPort> Executor<B> {
                 }
                 ledger.mark_outbox_completed(sequence, owner_id, claim_fencing_token, now)?;
                 Ok(DispatchResult::Observed {
+                    outbox_sequence: sequence,
+                    client_order_id: intent.client_order_id,
+                })
+            }
+            Ok(SubmissionOutcome::NotDispatched(evidence)) => {
+                // This legacy in-memory path has no durable state capable of
+                // authorizing a safe retry. Preserve lookup-only recovery; the
+                // PostgreSQL coordinator will record the typed evidence before
+                // it may expose a retry transition.
+                ledger.append(
+                    ExecutionEvent::SubmissionUnknown {
+                        client_order_id: intent.client_order_id.clone(),
+                        detail: bounded_execution_detail(&format!(
+                            "submission was not dispatched but retry is not durably authorized: {}",
+                            evidence.detail
+                        )),
+                    },
+                    now,
+                )?;
+                Ok(DispatchResult::SubmissionUnknown {
                     outbox_sequence: sequence,
                     client_order_id: intent.client_order_id,
                 })
@@ -473,7 +494,8 @@ impl<B: BrokerPort> Executor<B> {
             .find_order_by_client_id(&lifecycle.intent)
             .await?
         {
-            Some(event) => {
+            Some(observed) => {
+                let (event, _raw_response_json) = observed.into_parts();
                 append_validated_broker_event(ledger, client_order_id, event, now)?;
                 ledger.mark_outbox_completed(
                     outbox_sequence,
@@ -1360,9 +1382,18 @@ mod tests {
 
     use super::*;
     use crate::{
-        port::{CancellationNotDispatched, CancellationOutcome, CancellationRequestAccepted},
+        port::{
+            CancellationNotDispatched, CancellationOutcome, CancellationRequestAccepted,
+            ObservedBrokerOrder,
+        },
         store::{CancelOutboxClaimKind, PersistedTerminalBrokerEvent},
     };
+
+    fn observed_test_order(mut event: BrokerEvent, label: &str) -> ObservedBrokerOrder {
+        let raw_response_json = format!(r#"{{"test_evidence":"{label}"}}"#).into_bytes();
+        event.raw_payload_hash = HashDigest::sha256(&raw_response_json);
+        ObservedBrokerOrder::try_new(event, raw_response_json).unwrap()
+    }
 
     #[derive(Clone, Default)]
     struct AmbiguousBroker {
@@ -1395,7 +1426,7 @@ mod tests {
         async fn find_order_by_client_id(
             &self,
             _expected_intent: &OrderIntent,
-        ) -> Result<Option<trader_core::BrokerEvent>, ExecutionError> {
+        ) -> Result<Option<ObservedBrokerOrder>, ExecutionError> {
             *self.lookups.lock().unwrap() += 1;
             Ok(None)
         }
@@ -1455,7 +1486,7 @@ mod tests {
         async fn find_order_by_client_id(
             &self,
             _expected_intent: &OrderIntent,
-        ) -> Result<Option<BrokerEvent>, ExecutionError> {
+        ) -> Result<Option<ObservedBrokerOrder>, ExecutionError> {
             Ok(None)
         }
 
@@ -1473,17 +1504,20 @@ mod tests {
             _session_permit: &RegularTradingSessionPermit,
             _not_after: DateTime<Utc>,
         ) -> Result<SubmissionOutcome, ExecutionError> {
-            Ok(SubmissionOutcome::Observed(BrokerEvent {
-                provider_order_id: Some("provider-1".into()),
-                client_order_id: "wrong-client-id".into(),
-                status: "accepted".into(),
-                filled_quantity: WholeQuantity::ZERO,
-                fill_price: None,
-                provider_timestamp: intent.created_at,
-                received_at: intent.created_at,
-                raw_payload_hash: HashDigest::sha256("wrong-event"),
-                request_id: Some("request-1".into()),
-            }))
+            Ok(SubmissionOutcome::Observed(observed_test_order(
+                BrokerEvent {
+                    provider_order_id: Some("provider-1".into()),
+                    client_order_id: "wrong-client-id".into(),
+                    status: "accepted".into(),
+                    filled_quantity: WholeQuantity::ZERO,
+                    fill_price: None,
+                    provider_timestamp: intent.created_at,
+                    received_at: intent.created_at,
+                    raw_payload_hash: HashDigest::sha256("wrong-event"),
+                    request_id: Some("request-1".into()),
+                },
+                "wrong-client",
+            )))
         }
 
         async fn cancel_order(
@@ -1519,7 +1553,7 @@ mod tests {
         async fn find_order_by_client_id(
             &self,
             _expected_intent: &OrderIntent,
-        ) -> Result<Option<BrokerEvent>, ExecutionError> {
+        ) -> Result<Option<ObservedBrokerOrder>, ExecutionError> {
             Ok(None)
         }
 
@@ -1537,17 +1571,20 @@ mod tests {
             _session_permit: &RegularTradingSessionPermit,
             _not_after: DateTime<Utc>,
         ) -> Result<SubmissionOutcome, ExecutionError> {
-            Ok(SubmissionOutcome::Observed(BrokerEvent {
-                provider_order_id: Some("provider-1".into()),
-                client_order_id: intent.client_order_id.clone(),
-                status: "future_provider_status".into(),
-                filled_quantity: WholeQuantity::ZERO,
-                fill_price: None,
-                provider_timestamp: intent.created_at,
-                received_at: intent.created_at,
-                raw_payload_hash: HashDigest::sha256("invalid-event"),
-                request_id: Some("request-invalid".into()),
-            }))
+            Ok(SubmissionOutcome::Observed(observed_test_order(
+                BrokerEvent {
+                    provider_order_id: Some("provider-1".into()),
+                    client_order_id: intent.client_order_id.clone(),
+                    status: "future_provider_status".into(),
+                    filled_quantity: WholeQuantity::ZERO,
+                    fill_price: None,
+                    provider_timestamp: intent.created_at,
+                    received_at: intent.created_at,
+                    raw_payload_hash: HashDigest::sha256("invalid-event"),
+                    request_id: Some("request-invalid".into()),
+                },
+                "invalid-status",
+            )))
         }
 
         async fn cancel_order(
@@ -1621,7 +1658,7 @@ mod tests {
         async fn find_order_by_client_id(
             &self,
             _expected_intent: &OrderIntent,
-        ) -> Result<Option<BrokerEvent>, ExecutionError> {
+        ) -> Result<Option<ObservedBrokerOrder>, ExecutionError> {
             Err(ExecutionError::Broker("not used".into()))
         }
 

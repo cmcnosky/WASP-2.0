@@ -44,7 +44,8 @@ use crate::{
     lifecycle::BrokerOrderStatus,
     port::{
         BrokerPort, CancellationNotDispatched, CancellationOutcome, CancellationRequestAccepted,
-        RegularTradingSessionPermit, SubmissionOutcome,
+        ObservedBrokerOrder, RegularTradingSessionPermit, SubmissionNotDispatched,
+        SubmissionOutcome, MAX_SUBMISSION_RESPONSE_JSON_BYTES,
     },
     rate_limit::RequestClass,
     ExecutionError,
@@ -1102,25 +1103,63 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
         })
         .map_err(|error| ExecutionError::Broker(format!("serialize create order: {error}")))?;
 
-        let response = match self
-            .send(
-                HttpMethod::Post,
-                RequestClass::Routine,
-                Some(not_after),
-                format!("{PAPER_TRADING_API}/v2/orders"),
-                body,
-            )
-            .await
-        {
+        self.ensure_paper()?;
+        let request = HttpRequest {
+            method: HttpMethod::Post,
+            request_class: RequestClass::Routine,
+            not_after: Some(not_after),
+            url: format!("{PAPER_TRADING_API}/v2/orders"),
+            headers: BTreeMap::from([
+                ("Accept".into(), "application/json".into()),
+                ("Content-Type".into(), "application/json".into()),
+            ]),
+            body,
+        };
+        let response = match self.transport.send(request).await {
             Ok(response) => response,
-            Err(ExecutionError::SubmissionUnknown(detail)) => {
-                return Ok(SubmissionOutcome::Unknown { detail });
+            Err(TransportError::BeforeSend { detail }) => {
+                let observed_at = postgres_microsecond_timestamp(Utc::now());
+                let detail = bounded_message(&detail);
+                let reason_code = "TRANSPORT_BEFORE_SEND".to_owned();
+                let evidence_hash = HashDigest::of_json(&serde_json::json!({
+                    "client_order_id": &intent.client_order_id,
+                    "observed_at": observed_at,
+                    "reason_code": &reason_code,
+                    "detail": &detail,
+                }))?;
+                return Ok(SubmissionOutcome::NotDispatched(SubmissionNotDispatched {
+                    client_order_id: intent.client_order_id.clone(),
+                    observed_at,
+                    reason_code,
+                    detail,
+                    evidence_hash,
+                }));
             }
-            Err(error) => return Err(error),
+            Err(TransportError::Timeout { detail }) => {
+                return Ok(SubmissionOutcome::Unknown {
+                    detail: format!(
+                        "broker mutation timed out; reconcile by stable identity: {}",
+                        bounded_message(&detail)
+                    ),
+                });
+            }
+            Err(TransportError::ConnectionLost { detail }) => {
+                return Ok(SubmissionOutcome::Unknown {
+                    detail: format!(
+                        "broker mutation connection lost; reconcile by stable identity: {}",
+                        bounded_message(&detail)
+                    ),
+                });
+            }
         };
         if response.status != 200 {
             return Ok(SubmissionOutcome::Unknown {
                 detail: status_detail("submit order", &response),
+            });
+        }
+        if response.body.is_empty() || response.body.len() > MAX_SUBMISSION_RESPONSE_JSON_BYTES {
+            return Ok(SubmissionOutcome::Unknown {
+                detail: "successful POST response JSON is empty or exceeds its byte ceiling".into(),
             });
         }
         let evidence = match mutation_evidence(&response) {
@@ -1158,15 +1197,35 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
                 ),
             });
         }
-        Ok(SubmissionOutcome::Observed(
-            order.to_broker_event(&evidence),
-        ))
+        let observed =
+            match ObservedBrokerOrder::try_new(order.to_broker_event(&evidence), response.body) {
+                Ok(observed) => observed,
+                Err(error) => {
+                    return Ok(SubmissionOutcome::Unknown {
+                        detail: format!(
+                            "submitted order evidence could not be retained: {}",
+                            bounded_message(&error.to_string())
+                        ),
+                    });
+                }
+            };
+        Ok(SubmissionOutcome::Observed(observed))
     }
 
     pub async fn get_order_by_client_order_id(
         &self,
         client_order_id: &str,
     ) -> Result<Observed<Option<AlpacaOrder>>, ExecutionError> {
+        let (observed, _) = self
+            .get_order_by_client_order_id_with_raw(client_order_id)
+            .await?;
+        Ok(observed)
+    }
+
+    async fn get_order_by_client_order_id_with_raw(
+        &self,
+        client_order_id: &str,
+    ) -> Result<(Observed<Option<AlpacaOrder>>, Vec<u8>), ExecutionError> {
         validate_bounded_text("client_order_id", client_order_id, MAX_IDENTIFIER_BYTES)?;
         let url = format!(
             "{PAPER_TRADING_API}/v2/orders:by_client_order_id?client_order_id={}",
@@ -1183,12 +1242,20 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
             .await?;
         let evidence = evidence(&response)?;
         if response.status == 404 {
-            return Ok(Observed {
-                value: None,
-                evidence,
-            });
+            return Ok((
+                Observed {
+                    value: None,
+                    evidence,
+                },
+                response.body,
+            ));
         }
         require_status("get order by client_order_id", &response, 200)?;
+        if response.body.is_empty() || response.body.len() > MAX_SUBMISSION_RESPONSE_JSON_BYTES {
+            return Err(ExecutionError::Broker(
+                "order lookup response JSON is empty or exceeds its byte ceiling".into(),
+            ));
+        }
         let raw: RawOrder = parse_json("order lookup", &response.body)?;
         let order: AlpacaOrder = raw.try_into()?;
         if order.client_order_id != client_order_id {
@@ -1196,10 +1263,13 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
                 "order lookup returned a different client_order_id".into(),
             ));
         }
-        Ok(Observed {
-            value: Some(order),
-            evidence,
-        })
+        Ok((
+            Observed {
+                value: Some(order),
+                evidence,
+            },
+            response.body,
+        ))
     }
 
     /// Read-only recovery lookup for a cancellation whose DELETE may already
@@ -1616,22 +1686,23 @@ impl<T: HttpTransport> BrokerPort for AlpacaPaperAdapter<T> {
     async fn find_order_by_client_id(
         &self,
         expected_intent: &OrderIntent,
-    ) -> Result<Option<BrokerEvent>, ExecutionError> {
-        let observed = self
-            .get_order_by_client_order_id(&expected_intent.client_order_id)
+    ) -> Result<Option<ObservedBrokerOrder>, ExecutionError> {
+        let (observed, raw_response_json) = self
+            .get_order_by_client_order_id_with_raw(&expected_intent.client_order_id)
             .await?;
-        observed
-            .value
-            .map(|order| {
-                if !order_matches_intent(&order, expected_intent) {
-                    return Err(ExecutionError::Broker(
-                        "client-ID recovery returned an order that differs from the committed intent"
-                            .into(),
-                    ));
-                }
-                Ok(order.to_broker_event(&observed.evidence))
-            })
-            .transpose()
+        let Some(order) = observed.value else {
+            return Ok(None);
+        };
+        if !order_matches_intent(&order, expected_intent) {
+            return Err(ExecutionError::Broker(
+                "client-ID recovery returned an order that differs from the committed intent"
+                    .into(),
+            ));
+        }
+        Ok(Some(ObservedBrokerOrder::try_new(
+            order.to_broker_event(&observed.evidence),
+            raw_response_json,
+        )?))
     }
 
     async fn find_order_by_provider_id(
@@ -3702,8 +3773,9 @@ mod tests {
 
     #[tokio::test]
     async fn submit_is_exact_whole_share_day_limit_simple_contract() {
-        let transport =
-            FakeTransport::with_outcomes(vec![Ok(response(200, order_json("accepted")))]);
+        let broker_response = response(200, order_json("accepted"));
+        let exact_raw_response = broker_response.body.clone();
+        let transport = FakeTransport::with_outcomes(vec![Ok(broker_response)]);
         let outcome = adapter(transport.clone())
             .submit_order(
                 &intent(),
@@ -3712,11 +3784,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let SubmissionOutcome::Observed(event) = outcome else {
+        let SubmissionOutcome::Observed(observed) = outcome else {
             panic!("expected observed order");
         };
+        let event = observed.event();
         assert_eq!(event.status, "accepted");
         assert_eq!(event.request_id.as_deref(), Some("request-123"));
+        assert_eq!(observed.raw_response_json(), exact_raw_response);
+        assert_eq!(
+            event.raw_payload_hash,
+            HashDigest::sha256(&exact_raw_response)
+        );
 
         let request = &transport.requests()[0];
         assert_eq!(request.method, HttpMethod::Post);
@@ -3835,6 +3913,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn submit_before_send_is_typed_not_dispatched_with_zero_io() {
+        let transport = FakeTransport::with_outcomes(vec![Err(TransportError::BeforeSend {
+            detail: "rate permit unavailable\nsecret-like text".into(),
+        })]);
+        let outcome = adapter(transport.clone())
+            .submit_order(
+                &intent(),
+                &session_permit(),
+                "2026-07-20T13:30:10Z".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        let SubmissionOutcome::NotDispatched(evidence) = outcome else {
+            panic!("expected typed pre-I/O outcome");
+        };
+        assert_eq!(evidence.client_order_id, "client-1");
+        assert_eq!(evidence.reason_code, "TRANSPORT_BEFORE_SEND");
+        assert!(!evidence.detail.contains('\n'));
+        assert_eq!(transport.requests().len(), 1);
+        assert_eq!(transport.io_attempts(), 0);
+        assert_eq!(
+            evidence.evidence_hash,
+            HashDigest::of_json(&json!({
+                "client_order_id": &evidence.client_order_id,
+                "observed_at": evidence.observed_at,
+                "reason_code": &evidence.reason_code,
+                "detail": &evidence.detail,
+            }))
+            .unwrap()
+        );
+
+        let ambiguous_transport =
+            FakeTransport::with_outcomes(vec![Err(TransportError::Timeout {
+                detail: "after dispatch".into(),
+            })]);
+        let ambiguous = adapter(ambiguous_transport.clone())
+            .submit_order(
+                &intent(),
+                &session_permit(),
+                "2026-07-20T13:30:10Z".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(ambiguous, SubmissionOutcome::Unknown { .. }));
+        assert_eq!(ambiguous_transport.io_attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn oversized_success_response_is_not_observed() {
+        let mut raw_order = order_json("accepted");
+        raw_order["unexpected_padding"] = json!("x".repeat(MAX_SUBMISSION_RESPONSE_JSON_BYTES));
+        let transport = FakeTransport::with_outcomes(vec![Ok(response(200, raw_order))]);
+        let outcome = adapter(transport)
+            .submit_order(
+                &intent(),
+                &session_permit(),
+                "2026-07-20T13:30:10Z".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(outcome, SubmissionOutcome::Unknown { .. }));
+    }
+
+    #[tokio::test]
     async fn post_timeout_and_connection_loss_are_unknown_and_never_retried() {
         for error in [
             TransportError::Timeout {
@@ -3856,6 +3998,46 @@ mod tests {
             assert!(matches!(outcome, SubmissionOutcome::Unknown { .. }));
             assert_eq!(transport.requests().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn unknown_submission_recovery_is_one_get_with_raw_evidence() {
+        let recovery_response = response(200, order_json("accepted"));
+        let recovery_raw = recovery_response.body.clone();
+        let transport = FakeTransport::with_outcomes(vec![
+            Err(TransportError::Timeout {
+                detail: "response lost after dispatch".into(),
+            }),
+            Ok(recovery_response),
+        ]);
+        let paper = adapter(transport.clone());
+        let submission = paper
+            .submit_order(
+                &intent(),
+                &session_permit(),
+                "2026-07-20T13:30:10Z".parse().unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(submission, SubmissionOutcome::Unknown { .. }));
+
+        let recovered = BrokerPort::find_order_by_client_id(&paper, &intent())
+            .await
+            .unwrap()
+            .expect("GET recovery observed the stable client ID");
+        assert_eq!(recovered.raw_response_json(), recovery_raw);
+        assert_eq!(recovered.event().client_order_id, "client-1");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].method, HttpMethod::Post);
+        assert_eq!(requests[1].method, HttpMethod::Get);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method == HttpMethod::Post)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
