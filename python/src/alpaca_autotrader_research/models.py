@@ -29,6 +29,165 @@ class AttemptStatus(str, Enum):
     ABANDONED = "abandoned"
 
 
+class DependenceMethod(str, Enum):
+    STATIONARY_BLOCK_BOOTSTRAP = "stationary_block_bootstrap"
+
+
+class MissingDataAction(str, Enum):
+    QUARANTINE_SYMBOL = "quarantine_symbol"
+
+
+@dataclass(frozen=True)
+class CostModelAssumptions:
+    """Frozen conservative execution-cost inputs, expressed without floats."""
+
+    decision_to_arrival_latency_ms: int
+    half_spread_bps: int
+    adverse_slippage_bps: int
+    opportunity_cost_bps: int
+    non_fill_probability_bps: int
+    partial_fill_probability_bps: int
+    minimum_fee_cents: int
+    stress_variable_cost_multiplier_bps: int
+    stress_empirical_percentile_bps: int
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.decision_to_arrival_latency_ms <= 60_000:
+            raise ValueError("decision-to-arrival latency must be 1 through 60000 ms")
+        for name in (
+            "half_spread_bps",
+            "adverse_slippage_bps",
+            "opportunity_cost_bps",
+            "non_fill_probability_bps",
+            "partial_fill_probability_bps",
+            "minimum_fee_cents",
+        ):
+            if getattr(self, name) < 0:
+                raise ValueError(f"{name} must be non-negative")
+        if self.non_fill_probability_bps + self.partial_fill_probability_bps > 10_000:
+            raise ValueError("non-fill and partial-fill probabilities exceed one")
+        if self.stress_variable_cost_multiplier_bps < 20_000:
+            raise ValueError("stress cost must be at least twice modeled variable cost")
+        if not 9_500 <= self.stress_empirical_percentile_bps <= 10_000:
+            raise ValueError("stress empirical percentile must be at least the 95th percentile")
+
+
+@dataclass(frozen=True)
+class DependenceAndValidationDesign:
+    dependence_method: DependenceMethod
+    purge_sessions: int
+    embargo_sessions: int
+    bootstrap_block_sessions: int
+    bootstrap_resamples: int
+    one_sided_confidence_bps: int
+    deflated_sharpe_probability_bps: int
+    maximum_pbo_bps: int
+    familywise_alpha_bps: int
+
+    def __post_init__(self) -> None:
+        if self.purge_sessions < 252:
+            raise ValueError("purge must cover the longest preregistered lookback")
+        if self.embargo_sessions < 5:
+            raise ValueError("embargo must contain at least five sessions")
+        if not 2 <= self.bootstrap_block_sessions <= self.purge_sessions:
+            raise ValueError("bootstrap block length is outside the locked dependence design")
+        if self.bootstrap_resamples < 10_000:
+            raise ValueError("bootstrap requires at least 10000 resamples")
+        if self.one_sided_confidence_bps < 9_500:
+            raise ValueError("one-sided confidence must be at least 95 percent")
+        if self.deflated_sharpe_probability_bps < 9_500:
+            raise ValueError("deflated Sharpe probability gate must be at least 0.95")
+        if not 0 <= self.maximum_pbo_bps <= 1_000:
+            raise ValueError("PBO gate must be no more than 0.10")
+        if not 0 < self.familywise_alpha_bps <= 500:
+            raise ValueError("familywise alpha must be no more than 0.05")
+
+
+@dataclass(frozen=True)
+class MissingDataPolicy:
+    action: MissingDataAction
+    maximum_missing_sessions_per_symbol: int
+    reject_duplicate_timestamps: bool
+    reject_out_of_order_timestamps: bool
+    require_correction_versioning: bool
+
+    def __post_init__(self) -> None:
+        if self.maximum_missing_sessions_per_symbol != 0:
+            raise ValueError("v1 permits no unresolved missing strategy sessions")
+        if not all(
+            (
+                self.reject_duplicate_timestamps,
+                self.reject_out_of_order_timestamps,
+                self.require_correction_versioning,
+            )
+        ):
+            raise ValueError("v1 missing-data policy must fail closed and version corrections")
+
+
+@dataclass(frozen=True)
+class EconomicPowerDesign:
+    minimum_worthwhile_edge_bps: int
+    target_power_bps: int
+    one_sided_alpha_bps: int
+    minimum_effective_observations: int
+    method: str
+
+    def __post_init__(self) -> None:
+        if self.minimum_worthwhile_edge_bps <= 0:
+            raise ValueError("minimum worthwhile edge must be positive")
+        if self.target_power_bps < 8_000:
+            raise ValueError("declared power must be at least 80 percent")
+        if not 0 < self.one_sided_alpha_bps <= 500:
+            raise ValueError("one-sided alpha must be no more than 0.05")
+        if self.minimum_effective_observations < 30:
+            raise ValueError("effective sample requirement must be at least 30")
+        if not self.method.strip():
+            raise ValueError("power method must be explicit")
+
+
+@dataclass(frozen=True)
+class ConcentrationCriteria:
+    maximum_single_asset_contribution_bps: int
+    maximum_single_year_contribution_bps: int
+    maximum_top_five_trades_contribution_bps: int
+    minimum_completed_round_trips: int
+
+    def __post_init__(self) -> None:
+        for name in (
+            "maximum_single_asset_contribution_bps",
+            "maximum_single_year_contribution_bps",
+            "maximum_top_five_trades_contribution_bps",
+        ):
+            if not 0 < getattr(self, name) < 10_000:
+                raise ValueError(f"{name} must be strictly between zero and one")
+        if self.minimum_completed_round_trips < 30:
+            raise ValueError("concentration analysis requires at least 30 round trips")
+
+
+@dataclass(frozen=True)
+class HoldoutUnsealingPolicy:
+    authority: str
+    one_shot: bool
+    require_registration_hash_match: bool
+    reject_family_on_failure: bool
+    prohibit_retuning: bool
+    require_fresh_evidence_for_new_family: bool
+
+    def __post_init__(self) -> None:
+        if self.authority != "operator_only":
+            raise ValueError("holdout unsealing authority must remain operator-only")
+        if not all(
+            (
+                self.one_shot,
+                self.require_registration_hash_match,
+                self.reject_family_on_failure,
+                self.prohibit_retuning,
+                self.require_fresh_evidence_for_new_family,
+            )
+        ):
+            raise ValueError("holdout policy must be one-shot, hash-bound, and non-retunable")
+
+
 @dataclass(frozen=True)
 class DateWindow:
     name: ResearchStage
@@ -129,15 +288,26 @@ class Preregistration:
     data_snapshot_hash: str
     splits: ChronologicalSplits
     configurations: Tuple[StrategyConfiguration, ...]
+    cost_model: CostModelAssumptions
+    validation_design: DependenceAndValidationDesign
+    missing_data_policy: MissingDataPolicy
+    power_design: EconomicPowerDesign
+    concentration_criteria: ConcentrationCriteria
+    holdout_policy: HoldoutUnsealingPolicy
+    every_attempt_counts: bool
 
     def __post_init__(self) -> None:
         if self.created_at.tzinfo is None or self.created_at.utcoffset() is None:
             raise ValueError("created_at must be timezone-aware")
+        if not self.protocol_version.strip() or not self.family_id.strip():
+            raise ValueError("preregistration identity fields must be non-empty")
         require_sha256(self.universe_manifest_hash, field="universe_manifest_hash")
         require_sha256(self.data_snapshot_hash, field="data_snapshot_hash")
         identifiers = tuple(item.configuration_id for item in self.configurations)
         if len(identifiers) != 12 or len(set(identifiers)) != 12:
             raise ValueError("the preregistration must contain exactly 12 unique configurations")
+        if not self.every_attempt_counts:
+            raise ValueError("every attempted, failed, abandoned, or completed variation must count")
 
     @property
     def registration_hash(self) -> str:
