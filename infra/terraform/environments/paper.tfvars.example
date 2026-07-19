@@ -1,6 +1,9 @@
 environment             = "paper"
 expected_aws_account_id = "111111111111"
 aws_region              = "us-east-1"
+database_name           = "alpaca_autotrader_paper"
+rds_ca_cert_identifier  = "rds-ca-rsa2048-g1"
+expected_rds_ca_bundle_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 
 vpc_cidr                   = "10.42.0.0/16"
 public_subnet_cidrs         = ["10.42.0.0/24", "10.42.1.0/24"]

@@ -24,6 +24,31 @@ locals {
   is_live            = var.environment == "live"
   availability_zones = slice(data.aws_availability_zones.available.names, 0, 2)
 
+  execution_mode_matches_environment = (
+    var.execution_mode == "read_only" ||
+    (var.environment == "paper" && var.execution_mode == "paper") ||
+    (var.environment == "live" && var.execution_mode == "live")
+  )
+  live_activation_is_referenced = (
+    var.execution_mode != "live" ||
+    try(length(trimspace(var.live_activation_approval_id)), 0) >= 8
+  )
+  runtime_is_approved = (
+    !var.deploy_application ||
+    try(length(trimspace(var.runtime_ready_approval_id)), 0) >= 8
+  )
+  mutation_has_runtime = var.execution_mode == "read_only" || var.deploy_application
+  deployment_has_real_ca_digest = (
+    !var.deploy_application ||
+    var.expected_rds_ca_bundle_sha256 != "0000000000000000000000000000000000000000000000000000000000000000"
+  )
+  fargate_cpu_memory_pair_is_supported = (
+    (var.container_cpu == 256 && contains([512, 1024, 2048], var.container_memory)) ||
+    (var.container_cpu == 512 && contains([1024, 2048, 3072, 4096], var.container_memory)) ||
+    (var.container_cpu == 1024 && var.container_memory >= 2048 && var.container_memory <= 8192 && var.container_memory % 1024 == 0) ||
+    (var.container_cpu == 2048 && var.container_memory >= 4096 && var.container_memory <= 8192 && var.container_memory % 1024 == 0)
+  )
+
   db_instance_class = coalesce(
     var.db_instance_class,
     local.is_live ? "db.t4g.small" : "db.t4g.micro"
@@ -36,56 +61,5 @@ locals {
   common_tags = {
     DataClassification = "confidential"
     TradingAuthority   = var.execution_mode
-  }
-}
-
-check "aws_account_is_exact" {
-  assert {
-    condition     = data.aws_caller_identity.current.account_id == var.expected_aws_account_id
-    error_message = "The authenticated AWS account does not match expected_aws_account_id."
-  }
-}
-
-check "execution_mode_matches_environment" {
-  assert {
-    condition = (
-      var.execution_mode == "read_only" ||
-      (var.environment == "paper" && var.execution_mode == "paper") ||
-      (
-        var.environment == "live" &&
-        var.execution_mode == "live" &&
-        try(length(trimspace(var.live_activation_approval_id)), 0) >= 8
-      )
-    )
-    error_message = "Paper/live mutation mode must match its environment; live also requires an explicit approval reference."
-  }
-}
-
-check "runtime_is_deployable" {
-  assert {
-    condition = (
-      !var.deploy_application ||
-      try(length(trimspace(var.runtime_ready_approval_id)), 0) >= 8
-    )
-    error_message = "deploy_application requires reviewed evidence for a real long-running reconcile runtime."
-  }
-
-  assert {
-    condition     = var.execution_mode == "read_only" || var.deploy_application
-    error_message = "Broker mutation mode cannot be requested while the application task is disabled."
-  }
-}
-
-check "account_budget_has_destination" {
-  assert {
-    condition     = !var.create_account_budget || var.alert_email != null
-    error_message = "create_account_budget requires alert_email."
-  }
-}
-
-check "live_has_alert_destination" {
-  assert {
-    condition     = !local.is_live || var.alert_email != null
-    error_message = "Live infrastructure requires a confirmed operator alert email."
   }
 }

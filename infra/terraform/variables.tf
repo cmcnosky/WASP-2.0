@@ -111,6 +111,26 @@ variable "container_memory" {
   }
 }
 
+variable "rds_ca_cert_identifier" {
+  description = "Operator-reviewed RDS CA family pinned on the database instance."
+  type        = string
+
+  validation {
+    condition     = can(regex("^rds-ca-(rsa2048|rsa4096|ecc384)-g1$", var.rds_ca_cert_identifier))
+    error_message = "rds_ca_cert_identifier must be an explicitly reviewed current RDS g1 CA identifier."
+  }
+}
+
+variable "expected_rds_ca_bundle_sha256" {
+  description = "SHA-256 of the exact operator-approved AWS RDS root PEM injected at runtime."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[0-9a-f]{64}$", var.expected_rds_ca_bundle_sha256))
+    error_message = "expected_rds_ca_bundle_sha256 must be exactly 64 lowercase hex characters."
+  }
+}
+
 variable "execution_mode" {
   description = "Broker mutation authority requested for this deployment. Defaults fail-closed."
   type        = string
@@ -149,11 +169,13 @@ variable "db_instance_class" {
   nullable    = true
 
   validation {
-    condition = var.db_instance_class == null || contains([
+    condition = var.db_instance_class == null ? true : contains([
       "db.t4g.micro",
       "db.t4g.small",
       "db.t4g.medium"
-    ], var.db_instance_class)
+      ],
+      var.db_instance_class
+    )
     error_message = "db_instance_class must be a reviewed small Graviton class."
   }
 }
@@ -161,10 +183,10 @@ variable "db_instance_class" {
 variable "database_name" {
   description = "Initial PostgreSQL database name."
   type        = string
-  default     = "alpaca_autotrader"
+  nullable    = false
 
   validation {
-    condition     = can(regex("^[a-z][a-z0-9_]{2,62}$", var.database_name))
+    condition     = var.database_name != null && can(regex("^[a-z][a-z0-9_]{2,62}$", var.database_name))
     error_message = "database_name must be a valid lowercase PostgreSQL identifier."
   }
 }

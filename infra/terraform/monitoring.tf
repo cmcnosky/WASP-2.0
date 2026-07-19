@@ -3,6 +3,13 @@ resource "aws_sns_topic" "alerts" {
   kms_master_key_id = aws_kms_key.main.arn
 
   tags = merge(local.common_tags, { Name = "${local.name_prefix}-alerts" })
+
+  lifecycle {
+    precondition {
+      condition     = !local.is_live || var.alert_email != null
+      error_message = "Live infrastructure requires a confirmed operator alert email."
+    }
+  }
 }
 
 resource "aws_sns_topic_subscription" "email" {
@@ -392,5 +399,12 @@ resource "aws_budgets_budget" "account" {
     threshold_type             = "PERCENTAGE"
     notification_type          = "ACTUAL"
     subscriber_email_addresses = [coalesce(var.alert_email, "unset@example.invalid")]
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.alert_email != null
+      error_message = "create_account_budget requires alert_email."
+    }
   }
 }

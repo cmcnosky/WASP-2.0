@@ -72,8 +72,12 @@ split the approved rollout into two saved plans:
    and record its registry digest (not a tag).
 3. Using an isolated migration-only process, create the non-owner runtime DB role
    and exact grants described in `docs/runbooks/DATABASE_BOOTSTRAP.md`. Populate
-   its secret with JSON keys `username` and `password`. The RDS-managed master
-   secret must never be granted to ECS.
+   its secret with JSON keys `username`, `password`, and `ca_bundle_pem`. The CA
+   value is the current AWS-published root certificate for the exact RDS region;
+   record and approve its SHA-256 digest, set that digest separately in
+   `expected_rds_ca_bundle_sha256`, and verify it matches the pinned
+   `rds_ca_cert_identifier`. The RDS-managed master secret must never be granted
+   to ECS.
 4. Populate the Alpaca secret directly with JSON keys `api_key_id` and
    `api_secret_key`; do not print either secret.
 5. Keep `deploy_application=false` while the image lacks a long-running
@@ -89,10 +93,10 @@ or secret to make ECS appear healthy.
 
 Application code derives Alpaca hosts from the typed environment. Terraform does
 not accept or inject a broker URL. The provider uses `allowed_account_ids`, and
-an additional check compares caller identity. Use different GitHub environments
-and protection rules. If both stacks temporarily share an AWS account, pass the
-existing GitHub provider ARN to the second stack; every other named resource and
-state still remains distinct.
+an additional blocking KMS-resource precondition compares caller identity. Use
+different GitHub environments and protection rules. If both stacks temporarily
+share an AWS account, pass the existing GitHub provider ARN to the second stack;
+every other named resource and state still remains distinct.
 
 Live starts with `execution_mode=read_only` for at least five reconciled trading
 sessions. Switching to `live` requires the runbook, complete readiness evidence,
@@ -102,7 +106,10 @@ manual Alpaca emergency access.
 
 ## Validation and drills
 
-`../../scripts/check-infra.sh` runs format/init-without-backend/validate. Before
-live authority, complete and record task-kill, deployment rollback, RDS
-failover, PITR restore, credential rotation, alert delivery, dead-man, and region
+`../../scripts/check-infra.sh` runs format, init-without-backend, validation, two
+valid stopped-environment plans, and ten negative mocked plans that prove the
+account, environment/execution, activation, runtime, CA digest, Fargate,
+database-name, alert, and budget preconditions block unsafe plans. Before live
+authority, complete and record task-kill, deployment rollback, RDS failover,
+PITR restore, credential rotation, alert delivery, dead-man, and region
 benchmark drills. Always recover into reconcile-only.

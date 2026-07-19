@@ -9,10 +9,14 @@ rust-version.workspace = true
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-trader-core = { path = "../trader-core" }
-
-[dev-dependencies]
 tokio.workspace = true
+tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
+trader-core = { path = "../trader-core" }
+uuid.workspace = true

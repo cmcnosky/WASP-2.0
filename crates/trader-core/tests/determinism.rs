@@ -217,7 +217,7 @@ fn intent_requires_a_fresh_raw_post_decision_quote() {
 }
 
 #[test]
-fn execution_quote_requires_ordered_timestamps_and_at_most_fifteen_seconds() {
+fn execution_quote_requires_ordered_timestamps_and_provider_to_expiry_at_most_fifteen_seconds() {
     let release = release();
     let snapshot = snapshot(&release, "decision-quote-window");
     let evaluated = evaluate_decision(&snapshot, &release, &limits()).unwrap();
@@ -229,7 +229,7 @@ fn execution_quote_requires_ordered_timestamps_and_at_most_fifteen_seconds() {
         raw_price: "57".parse().unwrap(),
         provider_at,
         received_at,
-        valid_until: received_at + Duration::seconds(15),
+        valid_until: provider_at + Duration::seconds(15),
         payload_hash: HashDigest::sha256("quote-window"),
     };
 
@@ -248,6 +248,37 @@ fn execution_quote_requires_ordered_timestamps_and_at_most_fifteen_seconds() {
         &evaluated.risk,
         plan,
         &received_before_provider
+    )
+    .is_err());
+
+    let stale_at_receipt = FreshExecutionQuote {
+        provider_at,
+        received_at: provider_at + Duration::seconds(15) + Duration::nanoseconds(1),
+        valid_until: provider_at + Duration::seconds(20),
+        ..valid_quote.clone()
+    };
+    assert!(materialize_order_intent(
+        &snapshot,
+        &release,
+        &evaluated.risk,
+        plan,
+        &stale_at_receipt
+    )
+    .is_err());
+
+    // This was previously accepted because each individual leg was at most
+    // fifteen seconds even though the quote remained executable sixteen
+    // seconds after its provider timestamp.
+    let sixteen_second_total_window = FreshExecutionQuote {
+        valid_until: provider_at + Duration::seconds(16),
+        ..valid_quote.clone()
+    };
+    assert!(materialize_order_intent(
+        &snapshot,
+        &release,
+        &evaluated.risk,
+        plan,
+        &sixteen_second_total_window
     )
     .is_err());
 

@@ -71,6 +71,13 @@ resource "aws_kms_key" "main" {
   policy                  = data.aws_iam_policy_document.kms.json
 
   tags = merge(local.common_tags, { Name = "${local.name_prefix}-kms" })
+
+  lifecycle {
+    precondition {
+      condition     = data.aws_caller_identity.current.account_id == var.expected_aws_account_id
+      error_message = "The authenticated AWS account does not match expected_aws_account_id."
+    }
+  }
 }
 
 resource "aws_kms_alias" "main" {
@@ -161,7 +168,7 @@ resource "aws_secretsmanager_secret" "alpaca" {
 
 resource "aws_secretsmanager_secret" "runtime_database" {
   name                    = "${local.name_prefix}/runtime-database"
-  description             = "Least-privilege runtime username/password; never the RDS master"
+  description             = "Least-privilege runtime username/password plus approved RDS root PEM; never the RDS master"
   kms_key_id              = aws_kms_key.main.arn
   recovery_window_in_days = local.is_live ? 30 : 7
 

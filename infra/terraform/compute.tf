@@ -180,11 +180,13 @@ resource "aws_ecs_task_definition" "app" {
     environment = [
       { name = "APP_ENVIRONMENT", value = var.environment },
       { name = "EXECUTION_MODE", value = var.execution_mode },
-      { name = "ACTIVATION_APPROVAL_ID", value = coalesce(var.live_activation_approval_id, "") },
+      { name = "ACTIVATION_APPROVAL_ID", value = var.live_activation_approval_id == null ? "" : var.live_activation_approval_id },
       { name = "DATABASE_HOST", value = aws_db_instance.main.address },
+      { name = "EXPECTED_DATABASE_HOST_SHA256", value = sha256(aws_db_instance.main.address) },
       { name = "DATABASE_PORT", value = tostring(aws_db_instance.main.port) },
       { name = "DATABASE_NAME", value = var.database_name },
       { name = "DATABASE_REQUIRE_TLS", value = "true" },
+      { name = "EXPECTED_RDS_CA_BUNDLE_SHA256", value = var.expected_rds_ca_bundle_sha256 },
       { name = "DATA_BUCKET", value = aws_s3_bucket.data.id },
       { name = "AUDIT_BUCKET", value = aws_s3_bucket.audit.id },
       { name = "METRIC_NAMESPACE", value = local.metric_namespace },
@@ -200,6 +202,10 @@ resource "aws_ecs_task_definition" "app" {
       {
         name      = "DATABASE_PASSWORD"
         valueFrom = "${aws_secretsmanager_secret.runtime_database.arn}:password::"
+      },
+      {
+        name      = "RDS_CA_BUNDLE_PEM"
+        valueFrom = "${aws_secretsmanager_secret.runtime_database.arn}:ca_bundle_pem::"
       },
       {
         name      = "ALPACA_API_KEY_ID"
@@ -234,7 +240,47 @@ resource "aws_ecs_task_definition" "app" {
     ImageDigest = var.container_image_digest
   })
 
-  depends_on = [aws_iam_role_policy_attachment.ecs_execution]
+  lifecycle {
+    precondition {
+      condition     = local.execution_mode_matches_environment
+      error_message = "Paper/live mutation mode must match its environment."
+    }
+
+    precondition {
+      condition     = local.live_activation_is_referenced
+      error_message = "Live mutation mode requires an explicit approval reference."
+    }
+
+    precondition {
+      condition     = local.runtime_is_approved
+      error_message = "deploy_application requires reviewed evidence for a real long-running reconcile runtime."
+    }
+
+    precondition {
+      condition     = local.mutation_has_runtime
+      error_message = "Broker mutation mode cannot be requested while the application task is disabled."
+    }
+
+    precondition {
+      condition     = local.deployment_has_real_ca_digest
+      error_message = "deploy_application requires the real approved RDS root bundle digest, not the example placeholder."
+    }
+
+    precondition {
+      condition     = local.fargate_cpu_memory_pair_is_supported
+      error_message = "container_cpu and container_memory must form a supported bounded Fargate combination."
+    }
+
+    precondition {
+      condition     = !local.is_live || var.alert_email != null
+      error_message = "A live application task requires a confirmed operator alert email."
+    }
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.ecs_execution,
+    aws_iam_role_policy.ecs_execution_secrets
+  ]
 }
 
 resource "aws_ecs_service" "app" {

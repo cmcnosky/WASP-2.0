@@ -30,8 +30,11 @@ material into Terraform state.
 
 The RDS master credential is migration/bootstrap-only and is never readable by
 the ECS execution or task role. Application runtime uses a separate non-owner
-secret with JSON keys `username` and `password`; that role has no DDL, role,
-ownership, audit-table update/delete, or unfenced lease/outbox authority.
+secret with JSON keys `username`, `password`, and `ca_bundle_pem`; that role has
+no DDL, role, ownership, audit-table update/delete, or unfenced lease/outbox
+authority. The runtime requires hostname-verified TLS against the approved
+AWS-published RDS root and compares the exact bundle digest with a separately
+reviewed, nonsecret deployment value before trusting it.
 
 ## Access and isolation
 
@@ -48,6 +51,9 @@ access to its own buckets, metrics, and secrets.
 ## Supply chain
 
 - Commit Rust and Python lockfiles and deploy only immutable container digests.
+- Treat the pinned distroless image's system root store as attested supply-chain
+  state for broker HTTPS. The runtime filesystem is read-only; an image/root
+  store change requires a new SBOM, scan, review, and immutable digest.
 - Review all direct dependencies for purpose, maintenance, license, and
   transitive risk; record the decision in `docs/DEPENDENCIES.md`.
 - CI performs locked builds, vulnerability checks, secret scanning, image
