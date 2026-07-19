@@ -88,7 +88,24 @@ impl<B: BrokerPort> Executor<B> {
 
         match self.broker.submit_committed_intent(&intent).await {
             Ok(SubmissionOutcome::Observed(event)) => {
-                append_validated_broker_event(ledger, &intent.client_order_id, event, now)?;
+                if let Err(error) =
+                    append_validated_broker_event(ledger, &intent.client_order_id, event, now)
+                {
+                    // The POST reached the broker but its response cannot prove the
+                    // resulting order identity/state. Preserve lookup-only recovery
+                    // instead of returning with the lifecycle stuck in-flight.
+                    ledger.append(
+                        ExecutionEvent::SubmissionUnknown {
+                            client_order_id: intent.client_order_id.clone(),
+                            detail: format!("post-submit response validation failed: {error}"),
+                        },
+                        now,
+                    )?;
+                    return Ok(DispatchResult::SubmissionUnknown {
+                        outbox_sequence: sequence,
+                        client_order_id: intent.client_order_id,
+                    });
+                }
                 ledger.mark_outbox_completed(sequence, owner_id, claim_fencing_token, now)?;
                 Ok(DispatchResult::Observed {
                     outbox_sequence: sequence,
@@ -424,7 +441,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mismatched_observed_event_never_completes_outbox() {
+    async fn mismatched_observed_event_becomes_lookup_only_recovery() {
         let now: DateTime<Utc> = "2026-07-18T14:00:00Z".parse().unwrap();
         let account = HashDigest::sha256("paper-account");
         let authority = AuthorityDecision::test_enabled(
@@ -452,16 +469,20 @@ mod tests {
                 now,
             )
             .await;
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Ok(DispatchResult::SubmissionUnknown { .. })
+        ));
         assert_eq!(ledger.outbox()[0].completed_at, None);
         assert!(!ledger
             .records()
             .iter()
             .any(|record| matches!(&record.event, ExecutionEvent::BrokerEventObserved { .. })));
+        assert!(ledger.project_orders().unwrap()["stable-client-1"].requires_client_id_lookup());
     }
 
     #[tokio::test]
-    async fn invalid_matching_event_is_neither_appended_nor_completed() {
+    async fn invalid_matching_event_becomes_lookup_only_recovery() {
         let now: DateTime<Utc> = "2026-07-18T14:00:00Z".parse().unwrap();
         let account = HashDigest::sha256("paper-account");
         let authority = AuthorityDecision::test_enabled(
@@ -490,13 +511,16 @@ mod tests {
             )
             .await;
 
-        assert!(result.is_err());
+        assert!(matches!(
+            result,
+            Ok(DispatchResult::SubmissionUnknown { .. })
+        ));
         assert_eq!(ledger.outbox()[0].completed_at, None);
         assert!(!ledger
             .records()
             .iter()
             .any(|record| matches!(&record.event, ExecutionEvent::BrokerEventObserved { .. })));
-        assert!(ledger.project_orders().is_ok());
+        assert!(ledger.project_orders().unwrap()["stable-client-1"].requires_client_id_lookup());
     }
 
     #[tokio::test]
