@@ -3,13 +3,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod alpaca;
 pub mod authority;
 pub mod config;
+pub mod database;
 pub mod executor;
+pub mod http_transport;
 pub mod ledger;
 pub mod lifecycle;
 pub mod port;
+pub mod rate_limit;
 pub mod reconciliation;
+pub mod store;
 
 use thiserror::Error;
 

@@ -10,6 +10,7 @@ if command -v terraform >/dev/null 2>&1; then
   terraform -chdir="$terraform_root" fmt -check -recursive
   terraform -chdir="$terraform_root" init -backend=false -input=false -lockfile=readonly
   terraform -chdir="$terraform_root" validate
+  terraform -chdir="$terraform_root" test -test-directory=tests
   printf 'terraform formatting and validation passed\n'
   exit 0
 fi
@@ -32,6 +33,6 @@ docker run --rm \
   --workdir /workspace/infra/terraform \
   --entrypoint /bin/sh \
   "$terraform_image" \
-  -c 'mkdir -p "$TF_DATA_DIR" "$TF_PLUGIN_CACHE_DIR" && terraform fmt -check -recursive && terraform init -backend=false -input=false -lockfile=readonly && terraform validate'
+  -c 'mkdir -p "$TF_DATA_DIR" "$TF_PLUGIN_CACHE_DIR" && terraform fmt -check -recursive && terraform init -backend=false -input=false -lockfile=readonly && terraform validate && terraform test -test-directory=tests'
 
 printf 'terraform formatting and validation passed in pinned container\n'

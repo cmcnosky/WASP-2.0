@@ -16,6 +16,12 @@ resource "aws_db_parameter_group" "main" {
     apply_method = "pending-reboot"
   }
 
+  parameter {
+    name         = "password_encryption"
+    value        = "scram-sha-256"
+    apply_method = "immediate"
+  }
+
   tags = merge(local.common_tags, { Name = "${local.name_prefix}-postgres17" })
 
   lifecycle {
@@ -85,6 +91,7 @@ resource "aws_db_instance" "main" {
   enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
 
   parameter_group_name = aws_db_parameter_group.main.name
+  ca_cert_identifier   = var.rds_ca_cert_identifier
 
   performance_insights_enabled          = local.is_live
   performance_insights_kms_key_id       = local.is_live ? aws_kms_key.main.arn : null
@@ -93,7 +100,9 @@ resource "aws_db_instance" "main" {
   monitoring_interval = local.is_live ? 60 : 0
   monitoring_role_arn = local.is_live ? aws_iam_role.rds_monitor[0].arn : null
 
-  iam_database_authentication_enabled = true
+  # V1 deliberately uses the separate Secrets Manager runtime login. Do not
+  # enable a second, unimplemented authentication path.
+  iam_database_authentication_enabled = false
 
   apply_immediately         = false
   skip_final_snapshot       = !local.is_live
@@ -103,6 +112,13 @@ resource "aws_db_instance" "main" {
     Name       = local.name_prefix
     BackupTier = local.is_live ? "live-35-day-multiaz" : "paper-7-day-single-az"
   })
+
+  lifecycle {
+    precondition {
+      condition     = endswith(var.database_name, "_${var.environment}")
+      error_message = "database_name must end in the exact paper or live environment suffix."
+    }
+  }
 
   depends_on = [aws_iam_role_policy_attachment.rds_monitor]
 }

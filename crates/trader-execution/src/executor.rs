@@ -5,7 +5,7 @@ use trader_core::{BrokerEvent, OrderIntent};
 use crate::{
     authority::{AuthorityDecision, RecoveryAuthorityDecision},
     ledger::{ExecutionEvent, ExecutionLedger, OutboxAuthority},
-    port::{BrokerPort, SubmissionOutcome},
+    port::{BrokerPort, RegularTradingSessionPermit, SubmissionOutcome},
     ExecutionError,
 };
 
@@ -46,6 +46,7 @@ impl<B: BrokerPort> Executor<B> {
         owner_id: &str,
         claim_fencing_token: u64,
         intent: OrderIntent,
+        session_permit: &RegularTradingSessionPermit,
         now: DateTime<Utc>,
     ) -> Result<DispatchResult, ExecutionError> {
         if outbox_authority.created_fencing_token != claim_fencing_token
@@ -67,6 +68,8 @@ impl<B: BrokerPort> Executor<B> {
                 "fresh execution quote expired or is not yet observable".into(),
             ));
         }
+        let not_after = session_permit.submission_deadline(&intent, now)?;
+        self.broker.validate_submission_window(not_after, now)?;
         let sequence = ledger.commit_intent(intent.clone(), outbox_authority, now)?;
         let projected = ledger.project_orders()?;
         let lifecycle = projected.get(&intent.client_order_id).ok_or_else(|| {
@@ -86,7 +89,11 @@ impl<B: BrokerPort> Executor<B> {
             now,
         )?;
 
-        match self.broker.submit_committed_intent(&intent).await {
+        match self
+            .broker
+            .submit_committed_intent(&intent, session_permit, not_after)
+            .await
+        {
             Ok(SubmissionOutcome::Observed(event)) => {
                 if let Err(error) =
                     append_validated_broker_event(ledger, &intent.client_order_id, event, now)
@@ -97,7 +104,9 @@ impl<B: BrokerPort> Executor<B> {
                     ledger.append(
                         ExecutionEvent::SubmissionUnknown {
                             client_order_id: intent.client_order_id.clone(),
-                            detail: format!("post-submit response validation failed: {error}"),
+                            detail: bounded_execution_detail(&format!(
+                                "post-submit response validation failed: {error}"
+                            )),
                         },
                         now,
                     )?;
@@ -116,7 +125,7 @@ impl<B: BrokerPort> Executor<B> {
                 ledger.append(
                     ExecutionEvent::SubmissionUnknown {
                         client_order_id: intent.client_order_id.clone(),
-                        detail,
+                        detail: bounded_execution_detail(&detail),
                     },
                     now,
                 )?;
@@ -130,7 +139,7 @@ impl<B: BrokerPort> Executor<B> {
                 ledger.append(
                     ExecutionEvent::SubmissionUnknown {
                         client_order_id: intent.client_order_id.clone(),
-                        detail: error.to_string(),
+                        detail: bounded_execution_detail(&error.to_string()),
                     },
                     now,
                 )?;
@@ -176,7 +185,11 @@ impl<B: BrokerPort> Executor<B> {
             ));
         }
         ledger.claim_outbox(outbox_sequence, owner_id, claim_fencing_token, now)?;
-        match self.broker.find_order_by_client_id(client_order_id).await? {
+        match self
+            .broker
+            .find_order_by_client_id(&lifecycle.intent)
+            .await?
+        {
             Some(event) => {
                 append_validated_broker_event(ledger, client_order_id, event, now)?;
                 ledger.mark_outbox_completed(
@@ -196,6 +209,20 @@ impl<B: BrokerPort> Executor<B> {
             }),
         }
     }
+}
+
+fn bounded_execution_detail(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_graphic() || character == ' ' {
+                character
+            } else {
+                '?'
+            }
+        })
+        .take(256)
+        .collect()
 }
 
 fn append_validated_broker_event(
@@ -229,11 +256,14 @@ mod tests {
     };
 
     use super::*;
+    use crate::port::CancellationOutcome;
 
     #[derive(Clone, Default)]
     struct AmbiguousBroker {
         submissions: Arc<Mutex<u32>>,
         lookups: Arc<Mutex<u32>>,
+        deadlines: Arc<Mutex<Vec<DateTime<Utc>>>>,
+        reject_submission_window: bool,
     }
 
     #[async_trait]
@@ -242,9 +272,23 @@ mod tests {
             Err(ExecutionError::Broker("not used".into()))
         }
 
+        fn validate_submission_window(
+            &self,
+            broker_arrival_by: DateTime<Utc>,
+            now: DateTime<Utc>,
+        ) -> Result<(), ExecutionError> {
+            if !self.reject_submission_window && now < broker_arrival_by {
+                Ok(())
+            } else {
+                Err(ExecutionError::AuthorityDenied(
+                    "test broker-arrival window expired".into(),
+                ))
+            }
+        }
+
         async fn find_order_by_client_id(
             &self,
-            _client_order_id: &str,
+            _expected_intent: &OrderIntent,
         ) -> Result<Option<trader_core::BrokerEvent>, ExecutionError> {
             *self.lookups.lock().unwrap() += 1;
             Ok(None)
@@ -253,14 +297,20 @@ mod tests {
         async fn submit_committed_intent(
             &self,
             _intent: &OrderIntent,
+            _session_permit: &RegularTradingSessionPermit,
+            not_after: DateTime<Utc>,
         ) -> Result<SubmissionOutcome, ExecutionError> {
             *self.submissions.lock().unwrap() += 1;
+            self.deadlines.lock().unwrap().push(not_after);
             Ok(SubmissionOutcome::Unknown {
                 detail: "timeout".into(),
             })
         }
 
-        async fn cancel_order(&self, _provider_order_id: &str) -> Result<(), ExecutionError> {
+        async fn cancel_order(
+            &self,
+            _provider_order_id: &str,
+        ) -> Result<CancellationOutcome, ExecutionError> {
             Err(ExecutionError::Broker("not used".into()))
         }
     }
@@ -273,9 +323,23 @@ mod tests {
             Err(ExecutionError::Broker("not used".into()))
         }
 
+        fn validate_submission_window(
+            &self,
+            broker_arrival_by: DateTime<Utc>,
+            now: DateTime<Utc>,
+        ) -> Result<(), ExecutionError> {
+            if now < broker_arrival_by {
+                Ok(())
+            } else {
+                Err(ExecutionError::AuthorityDenied(
+                    "test broker-arrival window expired".into(),
+                ))
+            }
+        }
+
         async fn find_order_by_client_id(
             &self,
-            _client_order_id: &str,
+            _expected_intent: &OrderIntent,
         ) -> Result<Option<BrokerEvent>, ExecutionError> {
             Ok(None)
         }
@@ -283,6 +347,8 @@ mod tests {
         async fn submit_committed_intent(
             &self,
             intent: &OrderIntent,
+            _session_permit: &RegularTradingSessionPermit,
+            _not_after: DateTime<Utc>,
         ) -> Result<SubmissionOutcome, ExecutionError> {
             Ok(SubmissionOutcome::Observed(BrokerEvent {
                 provider_order_id: Some("provider-1".into()),
@@ -297,7 +363,10 @@ mod tests {
             }))
         }
 
-        async fn cancel_order(&self, _provider_order_id: &str) -> Result<(), ExecutionError> {
+        async fn cancel_order(
+            &self,
+            _provider_order_id: &str,
+        ) -> Result<CancellationOutcome, ExecutionError> {
             Err(ExecutionError::Broker("not used".into()))
         }
     }
@@ -310,9 +379,23 @@ mod tests {
             Err(ExecutionError::Broker("not used".into()))
         }
 
+        fn validate_submission_window(
+            &self,
+            broker_arrival_by: DateTime<Utc>,
+            now: DateTime<Utc>,
+        ) -> Result<(), ExecutionError> {
+            if now < broker_arrival_by {
+                Ok(())
+            } else {
+                Err(ExecutionError::AuthorityDenied(
+                    "test broker-arrival window expired".into(),
+                ))
+            }
+        }
+
         async fn find_order_by_client_id(
             &self,
-            _client_order_id: &str,
+            _expected_intent: &OrderIntent,
         ) -> Result<Option<BrokerEvent>, ExecutionError> {
             Ok(None)
         }
@@ -320,6 +403,8 @@ mod tests {
         async fn submit_committed_intent(
             &self,
             intent: &OrderIntent,
+            _session_permit: &RegularTradingSessionPermit,
+            _not_after: DateTime<Utc>,
         ) -> Result<SubmissionOutcome, ExecutionError> {
             Ok(SubmissionOutcome::Observed(BrokerEvent {
                 provider_order_id: Some("provider-1".into()),
@@ -334,7 +419,10 @@ mod tests {
             }))
         }
 
-        async fn cancel_order(&self, _provider_order_id: &str) -> Result<(), ExecutionError> {
+        async fn cancel_order(
+            &self,
+            _provider_order_id: &str,
+        ) -> Result<CancellationOutcome, ExecutionError> {
             Err(ExecutionError::Broker("not used".into()))
         }
     }
@@ -360,6 +448,30 @@ mod tests {
             materialization_evidence_hash: HashDigest::sha256("materialization"),
             created_at: now - chrono::Duration::seconds(1),
         }
+    }
+
+    fn session_permit(now: DateTime<Utc>) -> RegularTradingSessionPermit {
+        session_permit_with(now, now, now + chrono::Duration::hours(5))
+    }
+
+    fn session_permit_with(
+        now: DateTime<Utc>,
+        verified_at: DateTime<Utc>,
+        close: DateTime<Utc>,
+    ) -> RegularTradingSessionPermit {
+        RegularTradingSessionPermit::verified(
+            "NYSE".into(),
+            now.date_naive(),
+            now - chrono::Duration::hours(1),
+            close,
+            verified_at - chrono::Duration::seconds(1),
+            verified_at,
+            HashDigest::sha256("clock"),
+            HashDigest::sha256("calendar"),
+            Some("clock-request".into()),
+            Some("calendar-request".into()),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -391,6 +503,7 @@ mod tests {
                 "owner-1",
                 1,
                 intent(now),
+                &session_permit(now),
                 now,
             )
             .await
@@ -409,6 +522,7 @@ mod tests {
                 "owner-1",
                 1,
                 intent(now),
+                &session_permit(now),
                 now,
             )
             .await
@@ -470,6 +584,7 @@ mod tests {
                 "owner-1",
                 1,
                 intent(now),
+                &session_permit(now),
                 now,
             )
             .await;
@@ -511,6 +626,7 @@ mod tests {
                 "owner-1",
                 1,
                 intent(now),
+                &session_permit(now),
                 now,
             )
             .await;
@@ -554,6 +670,7 @@ mod tests {
                 "owner-1",
                 1,
                 intent(now),
+                &session_permit(now),
                 now,
             )
             .await;
@@ -591,12 +708,137 @@ mod tests {
                 "owner-1",
                 1,
                 wrong_release_intent,
+                &session_permit(now),
                 now,
             )
             .await;
 
         assert!(result.is_err());
         assert!(ledger.records().is_empty());
+        assert_eq!(*counters.submissions.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_deadline_is_minimum_of_quote_expiry_and_exact_session_close() {
+        let now: DateTime<Utc> = "2026-07-18T19:59:50Z".parse().unwrap();
+        let broker = AmbiguousBroker::default();
+        let counters = broker.clone();
+        let account = HashDigest::sha256("paper-account");
+        let authority = AuthorityDecision::test_enabled(
+            trader_core::Environment::Paper,
+            account,
+            "release-1",
+            1,
+            now,
+            now + chrono::Duration::minutes(1),
+        );
+        let outbox_authority = OutboxAuthority {
+            environment: trader_core::Environment::Paper,
+            account_fingerprint: account,
+            created_fencing_token: 1,
+        };
+        let close = now + chrono::Duration::seconds(5);
+        let mut ledger = ExecutionLedger::default();
+        let result = Executor::new(broker)
+            .commit_and_dispatch(
+                &mut ledger,
+                &authority,
+                &outbox_authority,
+                "owner-1",
+                1,
+                intent(now),
+                &session_permit_with(now, now, close),
+                now,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(result, DispatchResult::SubmissionUnknown { .. }));
+        assert_eq!(counters.deadlines.lock().unwrap().as_slice(), &[close]);
+    }
+
+    #[tokio::test]
+    async fn stale_or_pre_quote_session_permit_blocks_before_ledger_or_broker() {
+        let now: DateTime<Utc> = "2026-07-18T14:00:00Z".parse().unwrap();
+        let broker = AmbiguousBroker::default();
+        let counters = broker.clone();
+        let account = HashDigest::sha256("paper-account");
+        let authority = AuthorityDecision::test_enabled(
+            trader_core::Environment::Paper,
+            account,
+            "release-1",
+            1,
+            now,
+            now + chrono::Duration::minutes(1),
+        );
+        let outbox_authority = OutboxAuthority {
+            environment: trader_core::Environment::Paper,
+            account_fingerprint: account,
+            created_fencing_token: 1,
+        };
+        let stale = session_permit_with(
+            now,
+            now - chrono::Duration::seconds(16),
+            now + chrono::Duration::hours(5),
+        );
+        let mut ledger = ExecutionLedger::default();
+        let result = Executor::new(broker)
+            .commit_and_dispatch(
+                &mut ledger,
+                &authority,
+                &outbox_authority,
+                "owner-1",
+                1,
+                intent(now),
+                &stale,
+                now,
+            )
+            .await;
+
+        assert!(matches!(result, Err(ExecutionError::AuthorityDenied(_))));
+        assert!(ledger.records().is_empty());
+        assert_eq!(*counters.submissions.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn insufficient_broker_arrival_allowance_skips_before_intent_commit() {
+        let now: DateTime<Utc> = "2026-07-18T14:00:00Z".parse().unwrap();
+        let broker = AmbiguousBroker {
+            reject_submission_window: true,
+            ..AmbiguousBroker::default()
+        };
+        let counters = broker.clone();
+        let account = HashDigest::sha256("paper-account");
+        let authority = AuthorityDecision::test_enabled(
+            trader_core::Environment::Paper,
+            account,
+            "release-1",
+            1,
+            now,
+            now + chrono::Duration::minutes(1),
+        );
+        let outbox_authority = OutboxAuthority {
+            environment: trader_core::Environment::Paper,
+            account_fingerprint: account,
+            created_fencing_token: 1,
+        };
+        let mut ledger = ExecutionLedger::default();
+        let result = Executor::new(broker)
+            .commit_and_dispatch(
+                &mut ledger,
+                &authority,
+                &outbox_authority,
+                "owner-1",
+                1,
+                intent(now),
+                &session_permit(now),
+                now,
+            )
+            .await;
+
+        assert!(matches!(result, Err(ExecutionError::AuthorityDenied(_))));
+        assert!(ledger.records().is_empty());
+        assert!(ledger.outbox().is_empty());
         assert_eq!(*counters.submissions.lock().unwrap(), 0);
     }
 }

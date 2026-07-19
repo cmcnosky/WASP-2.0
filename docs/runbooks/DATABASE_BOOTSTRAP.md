@@ -7,6 +7,8 @@
 database; a unique login has been bound only to the `alpaca_trader_runtime`
 NOLOGIN role; and its secret is populated. Terraform creates the empty runtime
 secret but deliberately gives ECS no access to the RDS-managed master secret.
+The LOGIN name must end in the exact trust-domain suffix (`_paper` or `_live`);
+startup checks that binding before opening the ledger.
 
 ## Required runtime contract
 
@@ -40,9 +42,18 @@ the actual LOGIN, not just `SET ROLE` as an administrator.
 
 After tests pass, generate a strong unique runtime password without placing it
 in shell history, arguments, Terraform, Git, logs, or chat. Write JSON keys
-`username` and `password` directly to the environment's `runtime-database`
-Secrets Manager secret. Restart into reconcile-only and verify TLS connection,
-schema version, runtime permission self-check, and broker/local reconciliation.
+`username`, `password`, and `ca_bundle_pem` directly to the environment's
+`runtime-database` Secrets Manager secret. `ca_bundle_pem` must be the current
+AWS-published root certificate for the exact RDS region, downloaded over a
+separately verified administrative path; do not include a private key or a
+non-AWS trust bundle. Record its SHA-256 digest in the deployment evidence and
+set the same digest through the independently reviewed Terraform variable
+`expected_rds_ca_bundle_sha256`; the runtime fails closed if the secret value
+does not match. Confirm the database instance reports the approved
+`rds_ca_cert_identifier` before starting the task.
+Restart into reconcile-only and verify hostname-validated TLS, the pinned bundle
+digest, schema version, runtime permission self-check, and broker/local
+reconciliation.
 
 Rotate by creating/replacing the runtime credential, restarting
 stop-before-start into reconcile-only, validating permissions and reconciliation,

@@ -107,9 +107,11 @@ jobs:
       - name: Formatting
         run: terraform -chdir=infra/terraform fmt -check -recursive
       - name: Initialize without backend
-        run: terraform -chdir=infra/terraform init -backend=false -input=false
+        run: terraform -chdir=infra/terraform init -backend=false -input=false -lockfile=readonly
       - name: Validate
         run: terraform -chdir=infra/terraform validate
+      - name: Mocked plan tests
+        run: terraform -chdir=infra/terraform test -test-directory=tests
 
   container:
     runs-on: ubuntu-latest

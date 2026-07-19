@@ -150,14 +150,20 @@ pub fn materialize_order_intent(
         ));
     }
     let quote_validity = quote.valid_until.signed_duration_since(quote.received_at);
+    let quote_source_age = quote.received_at.signed_duration_since(quote.provider_at);
+    let quote_total_window = quote.valid_until.signed_duration_since(quote.provider_at);
     if quote.provider_at <= snapshot.as_of
-        || quote.received_at < quote.provider_at
+        || quote_source_age < Duration::zero()
+        || quote_source_age > Duration::seconds(15)
         || quote_validity <= Duration::zero()
         || quote_validity > Duration::seconds(15)
+        || quote_total_window <= Duration::zero()
+        || quote_total_window > Duration::seconds(15)
         || !quote.raw_price.fixed().is_positive()
     {
         return Err(CoreError::InvalidDomain(
-            "execution quote has invalid price, provenance ordering, or validity window".into(),
+            "execution quote has invalid price, source age, provenance ordering, or provider-to-expiry window"
+                .into(),
         ));
     }
     let band = Fixed::from_scaled(i128::from(risk.limits.marketable_limit_band_bps) * 100);
@@ -170,7 +176,8 @@ pub fn materialize_order_intent(
             "marketable price band produced a non-positive limit".into(),
         ));
     }
-    let limit_price = Price(quote.raw_price.fixed().checked_mul(price_factor)?);
+    let unquantized_limit = Price(quote.raw_price.fixed().checked_mul(price_factor)?);
+    let limit_price = quantize_equity_limit(unquantized_limit, plan.side)?;
     if plan.side == OrderSide::Buy {
         let order_notional = limit_price.checked_mul_quantity(plan.quantity.get())?;
         let available_cash = Money(
@@ -251,4 +258,69 @@ pub fn materialize_order_intent(
         materialization_evidence_hash: materialization_evidence,
         created_at: quote.received_at,
     })
+}
+
+/// Alpaca's current U.S.-equity limit-price variance is one cent at/above $1
+/// and one ten-thousandth below $1. Buys round up and sells round down so the
+/// intended marketable band is never weakened by normalization.
+fn quantize_equity_limit(price: Price, side: OrderSide) -> CoreResult<Price> {
+    let scaled = price.scaled();
+    if scaled <= 0 {
+        return Err(CoreError::InvalidDomain(
+            "limit price must remain positive before tick normalization".into(),
+        ));
+    }
+    let tick = if scaled >= Fixed::SCALE { 10_000 } else { 100 };
+    let remainder = scaled % tick;
+    let normalized = match (side, remainder) {
+        (_, 0) => scaled,
+        (OrderSide::Buy, remainder) => scaled
+            .checked_add(tick - remainder)
+            .ok_or(CoreError::ArithmeticOverflow("limit tick ceiling"))?,
+        (OrderSide::Sell, remainder) => scaled - remainder,
+    };
+    if normalized <= 0 {
+        return Err(CoreError::InvalidDomain(
+            "limit tick normalization produced a non-positive price".into(),
+        ));
+    }
+    Ok(Price::from_scaled(normalized))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    #[test]
+    fn equity_limit_ticks_round_in_the_marketable_direction() {
+        let above_dollar = Price::from_str("1.234567").unwrap();
+        assert_eq!(
+            quantize_equity_limit(above_dollar, OrderSide::Buy)
+                .unwrap()
+                .to_string(),
+            "1.240000"
+        );
+        assert_eq!(
+            quantize_equity_limit(above_dollar, OrderSide::Sell)
+                .unwrap()
+                .to_string(),
+            "1.230000"
+        );
+
+        let below_dollar = Price::from_str("0.123456").unwrap();
+        assert_eq!(
+            quantize_equity_limit(below_dollar, OrderSide::Buy)
+                .unwrap()
+                .to_string(),
+            "0.123500"
+        );
+        assert_eq!(
+            quantize_equity_limit(below_dollar, OrderSide::Sell)
+                .unwrap()
+                .to_string(),
+            "0.123400"
+        );
+    }
 }

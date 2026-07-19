@@ -1,6 +1,9 @@
 environment             = "live"
 expected_aws_account_id = "222222222222"
 aws_region              = "us-east-1"
+database_name           = "alpaca_autotrader_live"
+rds_ca_cert_identifier  = "rds-ca-rsa2048-g1"
+expected_rds_ca_bundle_sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
 
 vpc_cidr                   = "10.84.0.0/16"
 public_subnet_cidrs         = ["10.84.0.0/24", "10.84.1.0/24"]
