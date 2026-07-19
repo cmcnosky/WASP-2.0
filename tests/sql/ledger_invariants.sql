@@ -1404,6 +1404,14 @@ BEGIN
         'alpaca_trader_runtime',
         'append_cancel_not_dispatched_v2(text,text,uuid,uuid,bigint,uuid,text,integer,text,text,text,timestamp with time zone)',
         'EXECUTE'
+    ) OR NOT has_function_privilege(
+        'alpaca_trader_runtime',
+        'insert_fill_v3(text,text,uuid,bigint,text,text,uuid,numeric,numeric,numeric,timestamp with time zone,timestamp with time zone,text,text)',
+        'EXECUTE'
+    ) OR has_function_privilege(
+        'alpaca_trader_runtime',
+        'insert_fill_v2(text,text,uuid,bigint,text,text,uuid,numeric,numeric,numeric,timestamp with time zone,timestamp with time zone,text)',
+        'EXECUTE'
     ) THEN
         RAISE EXCEPTION 'runtime cancellation function allowlist drifted';
     END IF;
@@ -1456,10 +1464,10 @@ BEGIN
         RAISE EXCEPTION 'runtime safety-definition attestation mismatch count %', v_mismatches;
     END IF;
 
-    IF (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'function') <> 54
+    IF (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'function') <> 56
        OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'view') <> 3
-       OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'trigger') <> 34
-       OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'constraint') <> 140
+       OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'trigger') <> 36
+       OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'constraint') <> 143
        OR (SELECT COUNT(*) FROM runtime_schema_attestations
            WHERE object_kind = 'constraint'
              AND object_identity = 'application.json_hash_profile'
@@ -1797,11 +1805,11 @@ BEGIN
         RAISE EXCEPTION 'cancel unknown was not restart-discoverable with exact evidence';
     END IF;
 
-    v_ok := v_ok AND insert_fill_v2(
+    v_ok := v_ok AND insert_fill_v3(
         'paper', 'lease-test', '60000000-0000-0000-0000-000000000002', 2,
         'wrapper-fill-1', 'broker-wrapper-test',
         '83000000-0000-0000-0000-000000000001', 1, 500, 0,
-        clock_timestamp(), clock_timestamp(), repeat('a', 64)
+        clock_timestamp(), clock_timestamp(), repeat('a', 64), repeat('f', 64)
     );
     v_ok := v_ok AND insert_broker_event_v2(
         'paper', 'lease-test', '60000000-0000-0000-0000-000000000002', 2,

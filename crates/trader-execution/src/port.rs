@@ -1,12 +1,18 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use serde::Serialize;
-use trader_core::{AccountSnapshot, BrokerEvent, HashDigest, OrderIntent};
+use trader_core::{
+    AccountSnapshot, BrokerEvent, HashDigest, OrderIntent, OrderSide, Price, Symbol, WholeQuantity,
+};
 
 use crate::ExecutionError;
 
 const MAX_SESSION_PERMIT_AGE_SECONDS: i64 = 15;
 pub const MAX_SUBMISSION_RESPONSE_JSON_BYTES: usize = 64 * 1024;
+pub const MAX_FILL_ACTIVITY_RESPONSE_JSON_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_FILL_ACTIVITY_TRAVERSAL_JSON_BYTES: usize = 32 * 1024 * 1024;
 
 /// Exact provider response evidence for a successfully observed submission.
 ///
@@ -60,6 +66,123 @@ impl ObservedBrokerOrder {
 
     pub fn into_parts(self) -> (BrokerEvent, Vec<u8>) {
         (self.event, self.raw_response_json)
+    }
+}
+
+/// One stable incremental FILL activity joined to the exact REST page that
+/// carried it. The provider activity ID is the durable fill identity; the
+/// order response's cumulative quantity is never split into invented fills.
+#[derive(Clone, Eq, PartialEq)]
+pub struct ObservedBrokerFill {
+    pub fill_id: String,
+    pub fill_type: String,
+    pub provider_order_id: String,
+    pub symbol: Symbol,
+    pub side: OrderSide,
+    pub quantity: WholeQuantity,
+    pub cumulative_quantity: WholeQuantity,
+    pub leaves_quantity: WholeQuantity,
+    pub price: Price,
+    pub executed_at: DateTime<Utc>,
+    pub received_at: DateTime<Utc>,
+    pub request_id: Option<String>,
+    pub request_parameters_hash: HashDigest,
+    /// Stable hash of the normalized activity itself. This intentionally
+    /// excludes page grouping, receive time, request ID, and pagination so the
+    /// same provider fill remains idempotent when later traversals place it in
+    /// a different response page.
+    pub activity_evidence_hash: HashDigest,
+    pub raw_payload_hash: HashDigest,
+    raw_response_json: Arc<[u8]>,
+}
+
+impl ObservedBrokerFill {
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        fill_id: String,
+        fill_type: String,
+        provider_order_id: String,
+        symbol: Symbol,
+        side: OrderSide,
+        quantity: WholeQuantity,
+        cumulative_quantity: WholeQuantity,
+        leaves_quantity: WholeQuantity,
+        price: Price,
+        executed_at: DateTime<Utc>,
+        received_at: DateTime<Utc>,
+        request_id: Option<String>,
+        request_parameters_hash: HashDigest,
+        raw_payload_hash: HashDigest,
+        raw_response_json: Arc<[u8]>,
+    ) -> Result<Self, ExecutionError> {
+        if fill_id.trim().is_empty()
+            || !matches!(fill_type.as_str(), "fill" | "partial_fill")
+            || (fill_type == "fill") != (leaves_quantity == WholeQuantity::ZERO)
+            || provider_order_id.trim().is_empty()
+            || quantity == WholeQuantity::ZERO
+            || cumulative_quantity < quantity
+            || !price.fixed().is_positive()
+            || received_at < executed_at
+            || raw_response_json.is_empty()
+            || raw_response_json.len() > MAX_FILL_ACTIVITY_RESPONSE_JSON_BYTES
+            || HashDigest::sha256(&raw_response_json) != raw_payload_hash
+        {
+            return Err(ExecutionError::Broker(
+                "observed FILL activity evidence is incomplete or inconsistent".into(),
+            ));
+        }
+        let raw: serde_json::Value = serde_json::from_slice(&raw_response_json).map_err(|_| {
+            ExecutionError::Broker("observed FILL activity response is not JSON".into())
+        })?;
+        let occurrences = raw
+            .as_array()
+            .ok_or_else(|| {
+                ExecutionError::Broker("observed FILL activity response is not an array".into())
+            })?
+            .iter()
+            .filter(|item| item.get("id").and_then(serde_json::Value::as_str) == Some(&fill_id))
+            .count();
+        if occurrences != 1 {
+            return Err(ExecutionError::Broker(
+                "observed FILL activity ID is not uniquely present in its raw response".into(),
+            ));
+        }
+        let activity_evidence_hash = HashDigest::of_json(&serde_json::json!({
+            "schema": "wasp2/stable-rest-fill-activity/v1",
+            "fill_id": &fill_id,
+            "activity_type": "FILL",
+            "fill_type": &fill_type,
+            "provider_order_id": &provider_order_id,
+            "symbol": &symbol,
+            "side": side,
+            "quantity": quantity,
+            "cumulative_quantity": cumulative_quantity,
+            "leaves_quantity": leaves_quantity,
+            "price": price,
+            "executed_at": executed_at,
+        }))?;
+        Ok(Self {
+            fill_id,
+            fill_type,
+            provider_order_id,
+            symbol,
+            side,
+            quantity,
+            cumulative_quantity,
+            leaves_quantity,
+            price,
+            executed_at,
+            received_at,
+            request_id,
+            request_parameters_hash,
+            activity_evidence_hash,
+            raw_payload_hash,
+            raw_response_json,
+        })
+    }
+
+    pub fn raw_response_json(&self) -> &[u8] {
+        &self.raw_response_json
     }
 }
 
@@ -265,6 +388,19 @@ pub trait BrokerPort: Send + Sync {
         &self,
         expected_intent: &OrderIntent,
     ) -> Result<Option<ObservedBrokerOrder>, ExecutionError>;
+    /// Retrieves stable incremental FILL activities for one observed order.
+    /// The default is deliberately unavailable so test doubles and future
+    /// adapters cannot silently manufacture fills from cumulative order state.
+    async fn fills_for_order(
+        &self,
+        _expected_intent: &OrderIntent,
+        _provider_order_id: &str,
+        _expected_cumulative_quantity: WholeQuantity,
+    ) -> Result<Vec<ObservedBrokerFill>, ExecutionError> {
+        Err(ExecutionError::Broker(
+            "stable incremental FILL activity retrieval is unavailable".into(),
+        ))
+    }
     /// Reconciliation-only lookup for a cancellation whose DELETE may already
     /// have reached the broker. Implementations must validate both provider and
     /// client identities and must never turn this read into another DELETE.

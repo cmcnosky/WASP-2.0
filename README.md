@@ -2,8 +2,9 @@
 
 A private, single-user, clean-room trading system built as a Rust modular
 monolith. Python research calls the same compiled strategy, decision-replay,
-and risk core through PyO3; the performance-backtest boundary currently fails
-closed until its execution/cost/P&L model exists. The target is reliable
+and risk core through PyO3; performance replay is currently limited to a
+provider-free synthetic mechanics harness and rejects every real research
+stage. The target is reliable
 low-frequency automation over an Alpaca personal brokerage account—not
 high-frequency trading and not a product for third parties.
 
