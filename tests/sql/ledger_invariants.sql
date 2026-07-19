@@ -1438,15 +1438,19 @@ BEGIN
               AND NOT trigger.tgisinternal
               AND trigger.tgenabled IN ('O', 'A')
         )
-        WHEN 'constraint' THEN manifest.definition_sha256 IS DISTINCT FROM (
-            SELECT encode(sha256(convert_to(pg_get_constraintdef(con.oid, true), 'UTF8')), 'hex')
-            FROM pg_constraint AS con
-            JOIN pg_class AS relation ON relation.oid = con.conrelid
-            JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-            WHERE namespace.nspname || '.' || relation.relname || '.' || con.conname
-                = manifest.object_identity
-              AND con.convalidated
-        )
+        WHEN 'constraint' THEN manifest.definition_sha256 IS DISTINCT FROM CASE
+            WHEN manifest.object_identity = 'application.json_hash_profile' THEN
+                '0372e64987504c848a5146bbf31d5123e4e9e09dac09f57d150ede3b767eab45'
+            ELSE (
+                SELECT encode(sha256(convert_to(pg_get_constraintdef(con.oid, true), 'UTF8')), 'hex')
+                FROM pg_constraint AS con
+                JOIN pg_class AS relation ON relation.oid = con.conrelid
+                JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                WHERE namespace.nspname || '.' || relation.relname || '.' || con.conname
+                    = manifest.object_identity
+                  AND con.convalidated
+            )
+        END
     END;
     IF v_mismatches <> 0 THEN
         RAISE EXCEPTION 'runtime safety-definition attestation mismatch count %', v_mismatches;
@@ -1455,10 +1459,31 @@ BEGIN
     IF (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'function') <> 54
        OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'view') <> 3
        OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'trigger') <> 34
-       OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'constraint') <> 139
+       OR (SELECT COUNT(*) FROM runtime_schema_attestations WHERE object_kind = 'constraint') <> 140
+       OR (SELECT COUNT(*) FROM runtime_schema_attestations
+           WHERE object_kind = 'constraint'
+             AND object_identity = 'application.json_hash_profile'
+             AND definition_sha256 = '0372e64987504c848a5146bbf31d5123e4e9e09dac09f57d150ede3b767eab45') <> 1
     THEN
         RAISE EXCEPTION 'runtime safety-definition attestation is incomplete';
     END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+    BEGIN
+        UPDATE public.runtime_schema_attestations
+        SET definition_sha256 = repeat('0', 64)
+        WHERE object_kind = 'constraint'
+          AND object_identity = 'application.json_hash_profile';
+        RAISE EXCEPTION 'runtime hash-profile attestation was mutable';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM = 'runtime hash-profile attestation was mutable' THEN
+                RAISE;
+            END IF;
+    END;
 END;
 $$;
 

@@ -64,3 +64,41 @@ names the old one and explains migration and safety impact.
   strategy qualified” is a valid outcome; no trade is forced.
 - **Reason:** A profitable first trade cannot be guaranteed, and a backtest alone
   is not evidence adequate for autonomous capital.
+
+## 0008 — Predeployment canonical hash profile cutover
+
+- **Status:** accepted on 2026-07-19 before any authorized paper/live deployment
+- **Decision:** Application JSON evidence hashes use canonical profile
+  `wasp-json-sha256-v1`: recursively lexical object-key order, preserved array
+  order, compact UTF-8 JSON, UTC RFC 3339 timestamps using Rust/Chrono AutoSi
+  fractional precision (zero, three, six, or nine digits), and exact signed
+  `i128` or unsigned `u128` integers, then SHA-256. Every JSON floating-point
+  number is forbidden. Statistical values that become evidence must use an
+  explicit, versioned integer or decimal-string encoding. Rust and Python must
+  reproduce the same digest. Python-owned datetimes are microsecond-limited;
+  finer timestamps remain typed Rust/wire evidence. This profile replaces the
+  earlier Rust-struct-declaration-order behavior for every
+  `HashDigest::of_json` caller, including release, authority, decision, plan,
+  intent, reconciliation, and persistence evidence.
+- **Mechanical binding:** The cutover migration refuses to stamp the profile if
+  any pre-existing runtime, broker, research, or observer rows are present. It
+  records the profile digest in both the runtime and paper-observer schema
+  attestation manifests, and both compiled schema verifiers require that exact
+  attestation. Each Python experiment-ledger entry carries `hash_profile` in
+  its hashed material; a missing or mismatched profile fails verification. The
+  PyO3 module exports both the profile and the compiled performance-request byte
+  ceiling, and the Python bridge refuses to load a core that omits or disagrees
+  with either value. The CLI, bridge, PyO3 boundary, and Rust CLI enforce the
+  bounded performance-request size before or at deserialization.
+- **Migration and safety impact:** This changes deterministic hashes, IDs, and
+  rematerialization evidence. The repository's current authority/status records
+  state that no real RDS, Alpaca paper, or live deployment has run, so no
+  authoritative persisted runtime state is recognized for migration. Disposable
+  test data, earlier generated local artifacts, and earlier local experiment
+  ledgers without the profile field are invalidated. If any unrecorded external
+  state is later discovered, keep execution disabled and do not attempt recovery
+  with this profile. Any future hash-profile change must be versioned and ship
+  an explicit recovery/migration decision before deployment.
+- **Reason:** Field-declaration order is not a language-neutral canonical
+  contract. A single versioned profile is required for Rust/Python parity and
+  durable evidence verification.

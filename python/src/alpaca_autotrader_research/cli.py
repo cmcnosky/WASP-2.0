@@ -12,21 +12,28 @@ from typing import Any, Mapping, Sequence
 
 from .core_bridge import CoreBridge, CoreBridgeError
 from .gates import GateEvidence, evaluate_gates
-from .hashing import canonical_json_text
+from .hashing import (
+    canonical_json_text,
+    reject_duplicate_object_pairs,
+    reject_json_constant,
+)
 from .ledger import ExperimentLedger, LedgerIntegrityError
 from .protocol import generate_preregistration
 
 
-def _strict_object(path: Path) -> Mapping[str, Any]:
-    with path.open("r", encoding="utf-8") as source:
-        value = json.load(source, parse_constant=_reject_json_constant)
+def _strict_object(path: Path, *, max_bytes: int | None = None) -> Mapping[str, Any]:
+    with path.open("rb") as source:
+        payload = source.read() if max_bytes is None else source.read(max_bytes + 1)
+    if max_bytes is not None and len(payload) > max_bytes:
+        raise ValueError(f"{path} exceeds the serialized byte ceiling")
+    value = json.loads(
+        payload.decode("utf-8"),
+        object_pairs_hook=reject_duplicate_object_pairs,
+        parse_constant=reject_json_constant,
+    )
     if not isinstance(value, dict):
         raise ValueError(f"{path} must contain a JSON object")
     return value
-
-
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"non-finite JSON constant {value!r} is forbidden")
 
 
 def _timestamp(value: str) -> datetime:
@@ -42,6 +49,20 @@ def _write_json(value: Any, output: Path | None) -> None:
         sys.stdout.write(text)
     else:
         output.write_text(text, encoding="utf-8")
+
+
+def _write_core_json(value: Mapping[str, Any]) -> None:
+    """Preserve the compiled Rust response field order for parity evidence."""
+
+    sys.stdout.write(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
 
 
 def _gate_evidence(value: Mapping[str, Any]) -> GateEvidence:
@@ -110,6 +131,12 @@ def build_parser() -> argparse.ArgumentParser:
         "core-backtest", help="invoke the fail-closed Rust performance-backtest boundary"
     )
     backtest.add_argument("request", type=Path)
+
+    performance = subparsers.add_parser(
+        "core-performance-backtest",
+        help="invoke the deterministic Rust execution and performance replay",
+    )
+    performance.add_argument("request", type=Path)
     return parser
 
 
@@ -148,9 +175,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 release=_strict_object(args.release),
                 risk_limits=_strict_object(args.risk_limits),
             )
-            _write_json(response, None)
+            _write_core_json(response)
         elif args.command == "core-backtest":
-            _write_json(CoreBridge.load().backtest(_strict_object(args.request)), None)
+            _write_core_json(CoreBridge.load().backtest(_strict_object(args.request)))
+        elif args.command == "core-performance-backtest":
+            bridge = CoreBridge.load()
+            _write_core_json(
+                bridge.performance_backtest(
+                    _strict_object(
+                        args.request,
+                        max_bytes=bridge.identity.performance_request_max_bytes,
+                    )
+                )
+            )
         else:  # pragma: no cover - argparse enforces this
             raise AssertionError("unreachable command")
     except (CoreBridgeError, LedgerIntegrityError, OSError, ValueError, KeyError) as error:

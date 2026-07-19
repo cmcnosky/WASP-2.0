@@ -56,6 +56,40 @@ if [[ "${#migration_files[@]}" -eq 0 ]]; then
   exit 1
 fi
 
+profile_guard_database='alpaca_autotrader_profile_guard_test'
+docker exec "$container_name" createdb \
+  --username "$database_user" \
+  "$profile_guard_database"
+for migration_file in "${migration_files[@]}"; do
+  if [[ "${migration_file##*/}" == "0010_json_hash_profile_v1.sql" ]]; then
+    break
+  fi
+  docker exec --interactive "$container_name" psql \
+    --username "$database_user" \
+    --dbname "$profile_guard_database" \
+    --set=ON_ERROR_STOP=1 \
+    --file=- <"$migration_file" >/dev/null
+done
+docker exec "$container_name" psql \
+  --username "$database_user" \
+  --dbname "$profile_guard_database" \
+  --set=ON_ERROR_STOP=1 \
+  --command="INSERT INTO data_artifacts (artifact_id, logical_name, version, source, feed, adjustment_mode, as_of, available_at, object_uri, content_hash, metadata) VALUES ('91000000-0000-0000-0000-000000000001', 'precutover', 'v0', 'test', 'test', 'raw', clock_timestamp(), clock_timestamp(), 's3://invalid/precutover', repeat('a', 64), '{}'::jsonb);" \
+  >/dev/null
+if docker exec --interactive "$container_name" psql \
+  --username "$database_user" \
+  --dbname "$profile_guard_database" \
+  --set=ON_ERROR_STOP=1 \
+  --file=- <"$repo_root/migrations/0010_json_hash_profile_v1.sql" \
+  >/dev/null 2>&1; then
+  printf 'Hash-profile migration accepted pre-existing state\n' >&2
+  exit 1
+fi
+docker exec "$container_name" dropdb \
+  --username "$database_user" \
+  "$profile_guard_database"
+printf 'hash-profile empty-database migration guard passed\n'
+
 for migration_file in "${migration_files[@]}"; do
   printf 'applying %s\n' "${migration_file#"$repo_root"/}"
   docker exec --interactive "$container_name" psql \

@@ -5,7 +5,6 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
-import math
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import Enum
@@ -13,8 +12,40 @@ from pathlib import Path
 from typing import Any, Dict, Mapping
 
 
+JSON_HASH_PROFILE = "wasp-json-sha256-v1"
+I128_MIN = -(1 << 127)
+U128_MAX = (1 << 128) - 1
+
+
 class CanonicalizationError(ValueError):
     """Raised when a value cannot be represented deterministically."""
+
+
+def canonical_datetime_text(value: datetime) -> str:
+    """Match Rust/Chrono RFC 3339 AutoSi precision for Python datetimes."""
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise CanonicalizationError("datetime values must be timezone-aware")
+    utc = value.astimezone(timezone.utc)
+    base = utc.strftime("%Y-%m-%dT%H:%M:%S")
+    if utc.microsecond == 0:
+        return base + "Z"
+    if utc.microsecond % 1_000 == 0:
+        return f"{base}.{utc.microsecond // 1_000:03d}Z"
+    return f"{base}.{utc.microsecond:06d}Z"
+
+
+def reject_duplicate_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+
+def reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON constant {value!r} is forbidden")
 
 
 def _normalize(value: Any) -> Any:
@@ -24,9 +55,7 @@ def _normalize(value: Any) -> Any:
     if isinstance(value, Enum):
         return _normalize(value.value)
     if isinstance(value, datetime):
-        if value.tzinfo is None or value.utcoffset() is None:
-            raise CanonicalizationError("datetime values must be timezone-aware")
-        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        return canonical_datetime_text(value)
     if isinstance(value, date):
         return value.isoformat()
     if isinstance(value, Decimal):
@@ -43,10 +72,17 @@ def _normalize(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_normalize(item) for item in value]
     if isinstance(value, float):
-        if not math.isfinite(value):
-            raise CanonicalizationError("floating-point values must be finite")
+        raise CanonicalizationError(
+            "floating-point values are forbidden in canonical evidence; "
+            "use a versioned integer or decimal string encoding"
+        )
+    if isinstance(value, bool) or value is None or isinstance(value, str):
         return value
-    if value is None or isinstance(value, (str, int, bool)):
+    if isinstance(value, int):
+        if value < I128_MIN or value > U128_MAX:
+            raise CanonicalizationError(
+                "integer values must fit the canonical i128/u128 domain"
+            )
         return value
     raise CanonicalizationError(f"unsupported canonical value type: {type(value).__name__}")
 

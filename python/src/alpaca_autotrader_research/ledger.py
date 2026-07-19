@@ -10,7 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, TextIO, Tuple
 
-from .hashing import CanonicalizationError, canonical_json_text, sha256_digest
+from .hashing import (
+    JSON_HASH_PROFILE,
+    CanonicalizationError,
+    canonical_datetime_text,
+    canonical_json_text,
+    reject_duplicate_object_pairs,
+    reject_json_constant,
+    sha256_digest,
+)
 
 
 GENESIS_HASH = "0" * 64
@@ -20,9 +28,25 @@ class LedgerIntegrityError(RuntimeError):
     """The ledger cannot be trusted as an intact append-only sequence."""
 
 
+def _require_canonical_recorded_at(value: str) -> None:
+    try:
+        parsed = datetime.fromisoformat(
+            value[:-1] + "+00:00" if value.endswith("Z") else value
+        )
+    except ValueError as error:
+        raise ValueError("recorded_at is not a valid timestamp") from error
+    if (
+        parsed.tzinfo is None
+        or parsed.utcoffset() is None
+        or canonical_datetime_text(parsed) != value
+    ):
+        raise ValueError("recorded_at is not a canonical UTC timestamp")
+
+
 @dataclass(frozen=True)
 class LedgerEntry:
     sequence: int
+    hash_profile: str
     recorded_at: str
     event_type: str
     payload: Mapping[str, Any]
@@ -32,6 +56,7 @@ class LedgerEntry:
     def hash_material(self) -> Mapping[str, Any]:
         return {
             "sequence": self.sequence,
+            "hash_profile": self.hash_profile,
             "recorded_at": self.recorded_at,
             "event_type": self.event_type,
             "payload": self.payload,
@@ -52,9 +77,10 @@ class LedgerEntry:
             raise ValueError("event_type must be non-empty")
         if recorded_at.tzinfo is None or recorded_at.utcoffset() is None:
             raise ValueError("recorded_at must be timezone-aware")
-        recorded_text = recorded_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        recorded_text = canonical_datetime_text(recorded_at)
         material: Mapping[str, Any] = {
             "sequence": sequence,
+            "hash_profile": JSON_HASH_PROFILE,
             "recorded_at": recorded_text,
             "event_type": event_type,
             "payload": payload,
@@ -62,6 +88,7 @@ class LedgerEntry:
         }
         return cls(
             sequence=sequence,
+            hash_profile=JSON_HASH_PROFILE,
             recorded_at=recorded_text,
             event_type=event_type,
             payload=payload,
@@ -73,6 +100,7 @@ class LedgerEntry:
 def _decode_entry(line: str, line_number: int) -> LedgerEntry:
     expected_keys = {
         "sequence",
+        "hash_profile",
         "recorded_at",
         "event_type",
         "payload",
@@ -82,8 +110,8 @@ def _decode_entry(line: str, line_number: int) -> LedgerEntry:
     try:
         value = json.loads(
             line,
-            object_pairs_hook=_unique_object,
-            parse_constant=_reject_json_constant,
+            object_pairs_hook=reject_duplicate_object_pairs,
+            parse_constant=reject_json_constant,
         )
         if not isinstance(value, dict):
             raise TypeError("entry is not an object")
@@ -92,6 +120,7 @@ def _decode_entry(line: str, line_number: int) -> LedgerEntry:
         if (
             not isinstance(value["sequence"], int)
             or isinstance(value["sequence"], bool)
+            or value["hash_profile"] != JSON_HASH_PROFILE
             or not isinstance(value["recorded_at"], str)
             or not isinstance(value["event_type"], str)
             or not isinstance(value["payload"], dict)
@@ -101,30 +130,19 @@ def _decode_entry(line: str, line_number: int) -> LedgerEntry:
             raise TypeError("entry fields have invalid types")
         entry = LedgerEntry(
             sequence=value["sequence"],
+            hash_profile=value["hash_profile"],
             recorded_at=value["recorded_at"],
             event_type=value["event_type"],
             payload=value["payload"],
             previous_hash=value["previous_hash"],
             entry_hash=value["entry_hash"],
         )
+        _require_canonical_recorded_at(entry.recorded_at)
         if canonical_json_text(entry) != line:
             raise ValueError("entry is not in canonical serialized form")
         return entry
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
         raise LedgerIntegrityError(f"invalid ledger entry at line {line_number}") from error
-
-
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key {key!r}")
-        result[key] = value
-    return result
-
-
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"non-finite JSON constant {value!r} is forbidden")
 
 
 def _read_entries(ledger: TextIO) -> Tuple[LedgerEntry, ...]:
@@ -143,6 +161,10 @@ def verify_entries(entries: Iterable[LedgerEntry]) -> Tuple[LedgerEntry, ...]:
     verified = tuple(entries)
     previous_hash = GENESIS_HASH
     for expected_sequence, entry in enumerate(verified, start=1):
+        if entry.hash_profile != JSON_HASH_PROFILE:
+            raise LedgerIntegrityError(
+                f"unsupported hash profile at sequence {entry.sequence}"
+            )
         if entry.sequence != expected_sequence:
             raise LedgerIntegrityError(
                 f"expected sequence {expected_sequence}, found {entry.sequence}"
@@ -150,8 +172,9 @@ def verify_entries(entries: Iterable[LedgerEntry]) -> Tuple[LedgerEntry, ...]:
         if entry.previous_hash != previous_hash:
             raise LedgerIntegrityError(f"broken hash chain at sequence {entry.sequence}")
         try:
+            _require_canonical_recorded_at(entry.recorded_at)
             expected_hash = sha256_digest(entry.hash_material())
-        except CanonicalizationError as error:
+        except (CanonicalizationError, ValueError) as error:
             raise LedgerIntegrityError(
                 f"non-canonical value at sequence {entry.sequence}"
             ) from error

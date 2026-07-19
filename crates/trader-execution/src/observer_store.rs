@@ -261,6 +261,12 @@ WITH allowed_function(signature, result_type) AS (
     JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
     JOIN critical_table AS critical ON critical.table_name = relation.relname
     WHERE namespace.nspname = 'public'
+    UNION ALL
+    SELECT
+        'constraint',
+        'application.json_hash_profile',
+        '0372e64987504c848a5146bbf31d5123e4e9e09dac09f57d150ede3b767eab45',
+        TRUE
 ), compared AS (
     SELECT
         COALESCE(manifest.object_kind, observed.object_kind) AS object_kind,
@@ -1648,5 +1654,11 @@ mod tests {
             .contains("('public.reject_audit_mutation()', FALSE, FALSE)"));
         assert!(OBSERVER_SCHEMA_AND_PRIVILEGES_SQL
             .contains("procedure.prosecdef = required.security_definer"));
+        let profile_digest = HashDigest::sha256(trader_core::JSON_HASH_PROFILE).as_hex();
+        assert_eq!(
+            profile_digest,
+            "0372e64987504c848a5146bbf31d5123e4e9e09dac09f57d150ede3b767eab45"
+        );
+        assert!(OBSERVER_SCHEMA_AND_PRIVILEGES_SQL.contains(&profile_digest));
     }
 }

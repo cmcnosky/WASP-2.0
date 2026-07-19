@@ -2,8 +2,9 @@ use pyo3::{exceptions::PyValueError, prelude::*};
 use trader_core::{
     backtest::DecisionReplayRequest, evaluate_decision as evaluate_core,
     materialize_order_intent as materialize_core, run_backtest, run_decision_replay,
-    DecisionSnapshot, FreshExecutionQuote, OrderPlan, RiskDecision, RiskLimitSnapshot,
-    StrategyRelease,
+    run_performance_backtest, DecisionSnapshot, FreshExecutionQuote, OrderPlan,
+    PerformanceBacktestRequest, RiskDecision, RiskLimitSnapshot, StrategyRelease,
+    JSON_HASH_PROFILE, MAX_PERFORMANCE_REQUEST_BYTES,
 };
 
 fn invalid(error: impl std::fmt::Display) -> PyErr {
@@ -38,6 +39,19 @@ fn decision_replay(request_json: &str) -> PyResult<String> {
 }
 
 #[pyfunction]
+fn performance_backtest(request_json: &str) -> PyResult<String> {
+    if request_json.len() > MAX_PERFORMANCE_REQUEST_BYTES {
+        return Err(invalid(
+            "performance request exceeds the serialized byte ceiling",
+        ));
+    }
+    let request: PerformanceBacktestRequest =
+        serde_json::from_str(request_json).map_err(invalid)?;
+    let result = run_performance_backtest(&request).map_err(invalid)?;
+    serde_json::to_string(&result).map_err(invalid)
+}
+
+#[pyfunction]
 fn materialize_order_intent(
     snapshot_json: &str,
     release_json: &str,
@@ -59,7 +73,13 @@ fn alpaca_autotrader_core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(evaluate_decision, module)?)?;
     module.add_function(wrap_pyfunction!(backtest, module)?)?;
     module.add_function(wrap_pyfunction!(decision_replay, module)?)?;
+    module.add_function(wrap_pyfunction!(performance_backtest, module)?)?;
     module.add_function(wrap_pyfunction!(materialize_order_intent, module)?)?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    module.add("__json_hash_profile__", JSON_HASH_PROFILE)?;
+    module.add(
+        "__performance_request_max_bytes__",
+        MAX_PERFORMANCE_REQUEST_BYTES,
+    )?;
     Ok(())
 }

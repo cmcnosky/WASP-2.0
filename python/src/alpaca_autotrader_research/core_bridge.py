@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, Callable, Mapping
 
-from .hashing import canonical_json_text
+from .hashing import (
+    JSON_HASH_PROFILE,
+    canonical_json_text,
+    reject_duplicate_object_pairs,
+    reject_json_constant,
+)
 
 
 class CoreBridgeError(RuntimeError):
@@ -27,21 +32,24 @@ class CoreProtocolError(CoreBridgeError):
     """The compiled core returned an invalid response."""
 
 
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"non-finite JSON constant {value!r} is forbidden")
-
-
 @dataclass(frozen=True)
 class CoreIdentity:
     module: str
     version: str
+    json_hash_profile: str
+    performance_request_max_bytes: int
 
 
 class CoreBridge:
     """Invoke Rust only; this class intentionally has no decision fallback path."""
 
     MODULE_NAME = "alpaca_autotrader_core"
-    REQUIRED_CALLS = ("evaluate_decision", "backtest", "materialize_order_intent")
+    REQUIRED_CALLS = (
+        "evaluate_decision",
+        "backtest",
+        "performance_backtest",
+        "materialize_order_intent",
+    )
 
     def __init__(self, module: ModuleType) -> None:
         self._module = module
@@ -49,10 +57,30 @@ class CoreBridge:
             name for name in self.REQUIRED_CALLS if not callable(getattr(module, name, None))
         ]
         version = getattr(module, "__version__", None)
-        if missing or not isinstance(version, str) or not version:
+        profile = getattr(module, "__json_hash_profile__", None)
+        request_limit = getattr(module, "__performance_request_max_bytes__", None)
+        if (
+            missing
+            or not isinstance(version, str)
+            or not version
+            or profile != JSON_HASH_PROFILE
+            or not isinstance(request_limit, int)
+            or isinstance(request_limit, bool)
+            or request_limit <= 0
+        ):
             detail = ", ".join(missing) if missing else "__version__"
+            if not missing and profile != JSON_HASH_PROFILE:
+                detail = "__json_hash_profile__"
+            elif not missing and (
+                not isinstance(request_limit, int)
+                or isinstance(request_limit, bool)
+                or request_limit <= 0
+            ):
+                detail = "__performance_request_max_bytes__"
             raise CoreUnavailableError(f"incompatible Rust core; missing or invalid: {detail}")
-        self._identity = CoreIdentity(self.MODULE_NAME, version)
+        self._identity = CoreIdentity(
+            self.MODULE_NAME, version, profile, request_limit
+        )
 
     @classmethod
     def load(cls) -> "CoreBridge":
@@ -88,6 +116,17 @@ class CoreBridge:
         function = getattr(self._module, "backtest")
         return self._invoke(function, canonical_json_text(request))
 
+    def performance_backtest(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Replay performance through the compiled Rust core without a Python fallback."""
+
+        function = getattr(self._module, "performance_backtest")
+        serialized = canonical_json_text(request)
+        if len(serialized.encode("utf-8")) > self._identity.performance_request_max_bytes:
+            raise CoreInvocationError(
+                "performance request exceeds the compiled serialized byte ceiling"
+            )
+        return self._invoke(function, serialized)
+
     def materialize_order_intent(
         self,
         *,
@@ -119,7 +158,11 @@ class CoreBridge:
         if not isinstance(response, str):
             raise CoreProtocolError("Rust decision core must return a JSON string")
         try:
-            decoded = json.loads(response, parse_constant=_reject_json_constant)
+            decoded = json.loads(
+                response,
+                object_pairs_hook=reject_duplicate_object_pairs,
+                parse_constant=reject_json_constant,
+            )
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise CoreProtocolError("Rust decision core returned invalid strict JSON") from error
         if not isinstance(decoded, dict):

@@ -50,6 +50,7 @@ pub struct AccountingPosition {
 pub struct AccountingState {
     pub cash: Money,
     pub positions: BTreeMap<Symbol, AccountingPosition>,
+    /// Closed-price P&L less every fill fee, recognized when the fee is charged.
     pub realized_pnl: Money,
     pub fees: Money,
     pub dividends: Money,
@@ -141,6 +142,7 @@ fn apply(state: &mut AccountingState, event: &AccountingEvent) -> CoreResult<()>
                             .checked_div(crate::Fixed::from_units(i128::from(new_quantity))?)?,
                     );
                     state.cash = state.cash.checked_sub(notional)?.checked_sub(*fee)?;
+                    state.realized_pnl = state.realized_pnl.checked_sub(*fee)?;
                 }
                 OrderSide::Sell => {
                     if quantity.get() > position.quantity.get() {
@@ -239,5 +241,38 @@ mod tests {
         let result = replay(&events).unwrap();
         assert_eq!(result.cash, "909".parse().unwrap());
         assert_eq!(result.realized_pnl, "9".parse().unwrap());
+    }
+
+    #[test]
+    fn realized_pnl_recognizes_buy_and_sell_fill_fees_exactly_once() {
+        let at = Utc.with_ymd_and_hms(2025, 1, 2, 15, 0, 0).unwrap();
+        let symbol = Symbol::new("SPY").unwrap();
+        let events = vec![
+            AccountingEvent::CashDeposit {
+                amount: Money::from_units(1_000).unwrap(),
+                at,
+            },
+            AccountingEvent::Fill {
+                symbol: symbol.clone(),
+                side: OrderSide::Buy,
+                quantity: WholeQuantity::new(2),
+                price: "100".parse().unwrap(),
+                fee: "2".parse().unwrap(),
+                at,
+            },
+            AccountingEvent::Fill {
+                symbol,
+                side: OrderSide::Sell,
+                quantity: WholeQuantity::new(2),
+                price: "110".parse().unwrap(),
+                fee: "1".parse().unwrap(),
+                at,
+            },
+        ];
+
+        let result = replay(&events).unwrap();
+        assert_eq!(result.cash, Money::from_units(1_017).unwrap());
+        assert_eq!(result.realized_pnl, Money::from_units(17).unwrap());
+        assert_eq!(result.fees, Money::from_units(3).unwrap());
     }
 }

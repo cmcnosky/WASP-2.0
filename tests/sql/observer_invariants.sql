@@ -493,17 +493,21 @@ BEGIN
               AND NOT trigger.tgisinternal
               AND trigger.tgenabled IN ('O', 'A')
         )
-        WHEN 'constraint' THEN manifest.definition_sha256 IS DISTINCT FROM (
-            SELECT encode(sha256(convert_to(
-                pg_get_constraintdef(con.oid, true), 'UTF8'
-            )), 'hex')
-            FROM pg_catalog.pg_constraint AS con
-            JOIN pg_catalog.pg_class AS relation ON relation.oid = con.conrelid
-            JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
-            WHERE namespace.nspname || '.' || relation.relname || '.' || con.conname
-                = manifest.object_identity
-              AND con.convalidated
-        )
+        WHEN 'constraint' THEN manifest.definition_sha256 IS DISTINCT FROM CASE
+            WHEN manifest.object_identity = 'application.json_hash_profile' THEN
+                '0372e64987504c848a5146bbf31d5123e4e9e09dac09f57d150ede3b767eab45'
+            ELSE (
+                SELECT encode(sha256(convert_to(
+                    pg_get_constraintdef(con.oid, true), 'UTF8'
+                )), 'hex')
+                FROM pg_catalog.pg_constraint AS con
+                JOIN pg_catalog.pg_class AS relation ON relation.oid = con.conrelid
+                JOIN pg_catalog.pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+                WHERE namespace.nspname || '.' || relation.relname || '.' || con.conname
+                    = manifest.object_identity
+                  AND con.convalidated
+            )
+        END
     END;
 
     IF v_mismatches <> 0
@@ -516,7 +520,11 @@ BEGIN
        OR (SELECT COUNT(*) FROM public.paper_observer_schema_attestations
            WHERE object_kind = 'trigger') <> 10
        OR (SELECT COUNT(*) FROM public.paper_observer_schema_attestations
-           WHERE object_kind = 'constraint') <> 80
+           WHERE object_kind = 'constraint') <> 81
+       OR (SELECT COUNT(*) FROM public.paper_observer_schema_attestations
+           WHERE object_kind = 'constraint'
+             AND object_identity = 'application.json_hash_profile'
+             AND definition_sha256 = '0372e64987504c848a5146bbf31d5123e4e9e09dac09f57d150ede3b767eab45') <> 1
     THEN
         RAISE EXCEPTION 'paper observer safety attestation is incomplete or stale';
     END IF;
@@ -706,7 +714,8 @@ BEGIN
     BEGIN
         UPDATE public.paper_observer_schema_attestations
         SET definition_sha256 = repeat('0', 64)
-        WHERE object_kind = 'function';
+        WHERE object_kind = 'constraint'
+          AND object_identity = 'application.json_hash_profile';
         RAISE EXCEPTION 'observer attestation was mutable';
     EXCEPTION
         WHEN raise_exception THEN
