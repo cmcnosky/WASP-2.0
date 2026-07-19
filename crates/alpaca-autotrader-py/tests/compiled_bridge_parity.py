@@ -123,12 +123,55 @@ def main() -> None:
     module_file = getattr(core, "__file__", "")
     if not module_file or Path(module_file).suffix != ".so":
         raise AssertionError("alpaca_autotrader_core is not a compiled extension")
+
+    research_src = Path(__file__).resolve().parents[3] / "python" / "src"
+    sys.path.insert(0, str(research_src))
+    from alpaca_autotrader_research.core_bridge import CoreBridge
+
     snapshot, release, limits = inputs()
     replay_request = {
         "release": release,
         "risk_limits": limits,
         "snapshots": [snapshot],
     }
+    compiled_evaluation = core.evaluate_decision(
+        compact(snapshot), compact(release), compact(limits)
+    )
+    parsed = json.loads(compiled_evaluation)
+    plans = parsed.get("order_plans")
+    if not isinstance(plans, list) or len(plans) != 1 or "intents" in parsed:
+        raise AssertionError("compiled bridge did not return one safe non-executable plan")
+    risk = parsed["risk"]
+    plan = plans[0]
+    as_of = datetime.fromisoformat(snapshot["as_of"].replace("Z", "+00:00"))
+    provider_at = as_of + timedelta(seconds=1)
+    received_at = provider_at + timedelta(seconds=1)
+    quote = {
+        "symbol": plan["symbol"],
+        # Deliberately differ from the decision reference: executable pricing
+        # must come from this separately evidenced post-decision observation.
+        "raw_price": plan["decision_reference_price"] - 10_000,
+        "provider_at": timestamp(provider_at),
+        "received_at": timestamp(received_at),
+        "valid_until": timestamp(received_at + timedelta(seconds=10)),
+        "payload_hash": digest_bytes(b"fresh-execution-quote"),
+    }
+    materialization_arguments = (
+        compact(snapshot),
+        compact(release),
+        compact(risk),
+        compact(plan),
+        compact(quote),
+    )
+    compiled_intent = core.materialize_order_intent(*materialization_arguments)
+    python_intent = CoreBridge(core).materialize_order_intent(
+        snapshot=snapshot,
+        release=release,
+        risk_decision=risk,
+        plan=plan,
+        quote=quote,
+    )
+
     with tempfile.TemporaryDirectory() as directory:
         paths = {}
         for name, value in (
@@ -136,6 +179,9 @@ def main() -> None:
             ("release", release),
             ("limits", limits),
             ("replay", replay_request),
+            ("risk", risk),
+            ("plan", plan),
+            ("quote", quote),
         ):
             path = Path(directory, f"{name}.json")
             path.write_text(compact(value), encoding="utf-8")
@@ -177,9 +223,25 @@ def main() -> None:
             capture_output=True,
             text=True,
         ).stdout.strip()
-    compiled_evaluation = core.evaluate_decision(
-        compact(snapshot), compact(release), compact(limits)
-    )
+        cli_intent = subprocess.run(
+            [
+                str(args.binary),
+                "materialize-intent",
+                "--snapshot",
+                str(paths["snapshot"]),
+                "--release",
+                str(paths["release"]),
+                "--risk-decision",
+                str(paths["risk"]),
+                "--plan",
+                str(paths["plan"]),
+                "--quote",
+                str(paths["quote"]),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
     compiled_replay = core.decision_replay(compact(replay_request))
     compiled_backtest = core.backtest(compact(replay_request))
     if cli_evaluation != compiled_evaluation:
@@ -188,9 +250,29 @@ def main() -> None:
         raise AssertionError("CLI and compiled PyO3 replay bytes differ")
     if cli_backtest != compiled_backtest:
         raise AssertionError("CLI and compiled PyO3 backtest bytes differ")
-    parsed = json.loads(compiled_evaluation)
-    if "order_plans" not in parsed or "intents" in parsed:
-        raise AssertionError("compiled bridge did not return safe non-executable plans")
+    if cli_intent != compiled_intent:
+        raise AssertionError("CLI and compiled PyO3 intent bytes differ")
+    if compact(python_intent) != compiled_intent:
+        raise AssertionError("Python bridge and compiled PyO3 intent bytes differ")
+    intent = json.loads(compiled_intent)
+    fresh_quote_evidence = {
+        "decision_at": snapshot["as_of"],
+        "arrival_quote": quote["raw_price"],
+        "quote_provider_at": quote["provider_at"],
+        "quote_received_at": quote["received_at"],
+        "quote_valid_until": quote["valid_until"],
+        "quote_payload_hash": quote["payload_hash"],
+        "created_at": quote["received_at"],
+    }
+    for field, expected in fresh_quote_evidence.items():
+        if intent.get(field) != expected:
+            raise AssertionError(f"materialized intent lost fresh quote evidence: {field}")
+    if intent.get("decision_evidence_hash") != plan["decision_evidence_hash"]:
+        raise AssertionError("materialized intent lost decision evidence")
+    if intent.get("materialization_evidence_hash") == plan["decision_evidence_hash"]:
+        raise AssertionError("fresh quote was not bound into distinct materialization evidence")
+    if intent.get("arrival_quote") == plan["decision_reference_price"]:
+        raise AssertionError("intent reused its non-executable decision reference price")
     backtest = json.loads(compiled_backtest)
     if backtest.get("performance_evidence_available") is not False:
         raise AssertionError("incomplete backtest path did not fail closed")

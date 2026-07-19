@@ -26,6 +26,20 @@ def fake_core() -> ModuleType:
         "backtest",
         lambda request: json.dumps({"request": json.loads(request), "source": "rust"}),
     )
+    setattr(
+        module,
+        "materialize_order_intent",
+        lambda snapshot, release, risk, plan, quote: json.dumps(
+            {
+                "snapshot": json.loads(snapshot),
+                "release": json.loads(release),
+                "risk": json.loads(risk),
+                "plan": json.loads(plan),
+                "quote": json.loads(quote),
+                "source": "rust",
+            }
+        ),
+    )
     return module
 
 
@@ -41,6 +55,28 @@ class CoreBridgeTests(unittest.TestCase):
         with patch("importlib.import_module", side_effect=ImportError("missing")):
             with self.assertRaises(CoreUnavailableError):
                 CoreBridge.load()
+
+    def test_delegates_intent_materialization_to_compiled_contract(self) -> None:
+        response = CoreBridge(fake_core()).materialize_order_intent(
+            snapshot={"decision_id": "d", "as_of": "2025-01-01T21:00:00Z"},
+            release={"release_id": "r"},
+            risk_decision={"decision_id": "d", "disposition": "approved"},
+            plan={"plan_id": "p", "symbol": "SPY"},
+            quote={
+                "symbol": "SPY",
+                "provider_at": "2025-01-01T21:00:01Z",
+                "received_at": "2025-01-01T21:00:02Z",
+            },
+        )
+        self.assertEqual("rust", response["source"])
+        self.assertEqual("p", response["plan"]["plan_id"])
+        self.assertEqual("2025-01-01T21:00:01Z", response["quote"]["provider_at"])
+
+    def test_core_without_materialization_contract_is_incompatible(self) -> None:
+        module = fake_core()
+        delattr(module, "materialize_order_intent")
+        with self.assertRaises(CoreUnavailableError):
+            CoreBridge(module)
 
     def test_core_errors_and_invalid_output_fail_closed(self) -> None:
         module = fake_core()

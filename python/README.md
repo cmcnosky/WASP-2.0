@@ -8,6 +8,10 @@ Those decisions are made only by the compiled Rust extension named
 If the extension is absent, incompatible, returns invalid JSON, or raises an error, the bridge
 fails closed. There is deliberately no Python decision fallback.
 
+The bridge also delegates order-intent materialization to Rust. Callers must provide the exact
+released snapshot, risk decision, order plan, and fresh post-decision quote; Python cannot create
+or alter executable order fields.
+
 The package provides:
 
 - the locked chronological research protocol and 12-configuration preregistration;
