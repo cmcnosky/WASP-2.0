@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Timelike, Utc};
 use serde_json::{json, Value};
 use thiserror::Error;
-use trader_core::{Environment, HashDigest, OrderIntent, WholeQuantity};
+use trader_core::{Environment, HashDigest, Money, OrderIntent, WholeQuantity};
 use uuid::Uuid;
 
 use crate::{
@@ -18,15 +18,15 @@ use crate::{
         SubmissionOutcome,
     },
     store::{
-        BrokerEventWrite, BrokerWriteResult, ClaimedOutbox, CommitRecoveryKey, CommitResolution,
-        DurableExecutionChain, ExecutionStore, FencedLease, OutboxClaimKind,
+        BrokerEventWrite, BrokerFill, BrokerWriteResult, ClaimedOutbox, CommitRecoveryKey,
+        CommitResolution, DurableExecutionChain, ExecutionStore, FencedLease, OutboxClaimKind,
         PersistedExecutionChain, StoreError, UnresolvedOutbox,
     },
     ExecutionError,
 };
 
 const SUBMISSION_UNKNOWN_REASON: &str = "SUBMISSION_UNKNOWN";
-const TERMINAL_COMPLETION_REASON: &str = "BROKER_TERMINAL_ZERO_FILL";
+const TERMINAL_COMPLETION_REASON: &str = "BROKER_TERMINAL_TRUTH";
 const MAX_DETAIL_CHARACTERS: usize = 256;
 
 /// Persistence errors preserve deterministic commit-recovery evidence without
@@ -232,12 +232,6 @@ pub enum SubmissionProgress {
         outbox_id: Uuid,
         client_order_id: String,
         detail: String,
-    },
-    FillEvidenceRequired {
-        outbox_id: Uuid,
-        client_order_id: String,
-        provider_status: String,
-        cumulative_filled_quantity: WholeQuantity,
     },
     TerminalFinalized {
         outbox_id: Uuid,
@@ -505,17 +499,33 @@ impl<B: BrokerPort> DurableSubmissionCoordinator<B> {
     ) -> Result<SubmissionProgress, ExecutionError> {
         validate_observed(&observed, intent)?;
         let event = observed.event();
-        if event.filled_quantity != WholeQuantity::ZERO {
-            // The order response carries cumulative fill quantity, but not the
-            // stable incremental FILL activity IDs required by the ledger.
-            // Never manufacture fill rows from an average price.
-            return Ok(SubmissionProgress::FillEvidenceRequired {
-                outbox_id,
-                client_order_id: intent.client_order_id.clone(),
-                provider_status: event.status.clone(),
-                cumulative_filled_quantity: event.filled_quantity,
-            });
-        }
+        let provider_order_id = event.provider_order_id.as_deref().ok_or_else(|| {
+            ExecutionError::Lifecycle("observed broker event lacks provider order identity".into())
+        })?;
+        let observed_fills = if event.filled_quantity == WholeQuantity::ZERO {
+            Vec::new()
+        } else {
+            self.broker
+                .fills_for_order(intent, provider_order_id, event.filled_quantity)
+                .await?
+        };
+        let fills = observed_fills
+            .iter()
+            .map(|fill| BrokerFill {
+                fill_id: fill.fill_id.clone(),
+                quantity: fill.quantity,
+                price: fill.price,
+                // Alpaca's FILL activity contract carries execution economics
+                // but not a per-fill commission/fee. Separate account-activity
+                // accounting must append any fee; inventing one here would be
+                // worse than the explicit zero evidence.
+                fee: Money::ZERO,
+                executed_at: fill.executed_at,
+                received_at: fill.received_at,
+                raw_payload_hash: fill.raw_payload_hash,
+                activity_evidence_hash: fill.activity_evidence_hash,
+            })
+            .collect::<Vec<_>>();
 
         let raw_payload: Value =
             serde_json::from_slice(observed.raw_response_json()).map_err(|_| {
@@ -527,7 +537,7 @@ impl<B: BrokerPort> DurableSubmissionCoordinator<B> {
                 intent_id: &intent.intent_id,
                 event,
                 raw_payload: &raw_payload,
-                fills: &[],
+                fills: &fills,
                 lease,
             },
         )
@@ -1012,7 +1022,7 @@ fn submission_store_error(error: SubmissionStoreError) -> ExecutionError {
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::VecDeque,
+        collections::{BTreeMap, VecDeque},
         sync::{Arc, Mutex},
     };
 
@@ -1024,7 +1034,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::port::{CancellationOutcome, ObservedBrokerOrder};
+    use crate::port::{CancellationOutcome, ObservedBrokerFill, ObservedBrokerOrder};
 
     #[derive(Clone, Copy)]
     enum SubmitPlan {
@@ -1127,6 +1137,76 @@ mod tests {
             }
         }
 
+        async fn fills_for_order(
+            &self,
+            expected_intent: &OrderIntent,
+            provider_order_id: &str,
+            expected_cumulative_quantity: WholeQuantity,
+        ) -> Result<Vec<ObservedBrokerFill>, ExecutionError> {
+            if expected_cumulative_quantity == WholeQuantity::ZERO {
+                return Ok(Vec::new());
+            }
+            let activities = (1..=expected_cumulative_quantity.get())
+                .map(|cumulative| {
+                    let leaves = expected_intent.quantity.get() - cumulative;
+                    json!({
+                        "id": format!("fill-activity-{cumulative}"),
+                        "activity_type": "FILL",
+                        "type": if leaves == 0 { "fill" } else { "partial_fill" },
+                        "order_id": provider_order_id,
+                        "symbol": expected_intent.symbol,
+                        "side": expected_intent.side,
+                        "qty": "1",
+                        "cum_qty": cumulative.to_string(),
+                        "leaves_qty": leaves.to_string(),
+                        "price": "10",
+                        "transaction_time": self.now,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let raw: Arc<[u8]> = serde_json::to_vec(&activities).unwrap().into();
+            let raw_hash = HashDigest::sha256(raw.as_ref());
+            let received_at = self.now
+                + chrono::Duration::seconds(
+                    i64::try_from(expected_cumulative_quantity.get()).unwrap(),
+                );
+            activities
+                .iter()
+                .enumerate()
+                .map(|(index, activity)| {
+                    let cumulative = u64::try_from(index).unwrap() + 1;
+                    let leaves = expected_intent.quantity.get() - cumulative;
+                    ObservedBrokerFill::try_new(
+                        activity["id"].as_str().unwrap().to_owned(),
+                        if leaves == 0 {
+                            "fill".into()
+                        } else {
+                            "partial_fill".into()
+                        },
+                        provider_order_id.to_owned(),
+                        expected_intent.symbol.clone(),
+                        expected_intent.side,
+                        WholeQuantity::new(1),
+                        WholeQuantity::new(cumulative),
+                        WholeQuantity::new(leaves),
+                        "10".parse().unwrap(),
+                        self.now,
+                        received_at,
+                        Some(format!(
+                            "fill-request-{}",
+                            expected_cumulative_quantity.get()
+                        )),
+                        HashDigest::sha256(format!(
+                            "fill-request-{}",
+                            expected_cumulative_quantity.get()
+                        )),
+                        raw_hash,
+                        Arc::clone(&raw),
+                    )
+                })
+                .collect()
+        }
+
         async fn find_order_by_provider_id(
             &self,
             _provider_order_id: &str,
@@ -1204,7 +1284,8 @@ mod tests {
         broker_event_plans: VecDeque<WritePlan>,
         finalization_plans: VecDeque<WritePlan>,
         unknown_writes: usize,
-        broker_event_writes: Vec<(BrokerEvent, Value)>,
+        broker_event_writes: Vec<(BrokerEvent, Value, Vec<BrokerFill>)>,
+        durable_fills: BTreeMap<String, BrokerFill>,
         finalizations: usize,
     }
 
@@ -1223,6 +1304,7 @@ mod tests {
                 finalization_plans: VecDeque::new(),
                 unknown_writes: 0,
                 broker_event_writes: Vec::new(),
+                durable_fills: BTreeMap::new(),
                 finalizations: 0,
             }
         }
@@ -1321,8 +1403,38 @@ mod tests {
             write: &BrokerEventWrite<'_>,
         ) -> Result<BrokerWriteResult, SubmissionStoreError> {
             self.log.lock().unwrap().push("record_event".into());
-            self.broker_event_writes
-                .push((write.event.clone(), write.raw_payload.clone()));
+            for fill in write.fills {
+                if let Some(existing) = self.durable_fills.get(&fill.fill_id) {
+                    if existing.quantity != fill.quantity
+                        || existing.price != fill.price
+                        || existing.fee != fill.fee
+                        || existing.executed_at != fill.executed_at
+                        || existing.activity_evidence_hash != fill.activity_evidence_hash
+                    {
+                        return Err(SubmissionStoreError::Store(
+                            "stable fill identity changed economics".into(),
+                        ));
+                    }
+                } else {
+                    self.durable_fills
+                        .insert(fill.fill_id.clone(), fill.clone());
+                }
+            }
+            let durable_quantity = self
+                .durable_fills
+                .values()
+                .try_fold(0u64, |total, fill| total.checked_add(fill.quantity.get()))
+                .ok_or_else(|| SubmissionStoreError::Store("fill sum overflowed".into()))?;
+            if durable_quantity != write.event.filled_quantity.get() {
+                return Err(SubmissionStoreError::Store(
+                    "durable fill sum differs from cumulative broker truth".into(),
+                ));
+            }
+            self.broker_event_writes.push((
+                write.event.clone(),
+                write.raw_payload.clone(),
+                write.fills.to_vec(),
+            ));
             let provider_order_id = write.event.provider_order_id.as_deref().unwrap();
             let broker_event_id = stable_named_uuid(&format!(
                 "broker-event:{provider_order_id}:{}",
@@ -1753,7 +1865,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonzero_cumulative_fill_requires_stable_fill_evidence() {
+    async fn nonzero_cumulative_fill_persists_stable_activity_evidence() {
         let fixture = Fixture::new();
         let log = Arc::new(Mutex::new(Vec::new()));
         let broker = FakeBroker::new(
@@ -1779,10 +1891,76 @@ mod tests {
             .unwrap();
         assert!(matches!(
             result,
-            SubmissionProgress::FillEvidenceRequired { .. }
+            SubmissionProgress::BrokerStatePersisted { .. }
         ));
-        assert!(store.broker_event_writes.is_empty());
+        assert_eq!(store.broker_event_writes.len(), 1);
+        assert_eq!(store.broker_event_writes[0].2.len(), 1);
+        assert_eq!(store.broker_event_writes[0].2[0].fill_id, "fill-activity-1");
         assert_eq!(store.finalizations, 0);
+    }
+
+    #[tokio::test]
+    async fn partial_then_terminal_reobservation_is_idempotent_and_finalizes_once() {
+        let mut fixture = Fixture::new();
+        fixture.plan.quantity = WholeQuantity::new(2);
+        fixture.intent.quantity = WholeQuantity::new(2);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let broker = FakeBroker::new(log.clone(), fixture.now, [], []);
+        let observed_broker = broker.clone();
+        let coordinator = DurableSubmissionCoordinator::new(broker);
+        let mut store = FakeStore::new(log);
+        let outbox_id = fixture
+            .claim(OutboxClaimKind::RecoveryLookupOnly, 2)
+            .outbox_id;
+        store.completion_claims.push_back(Some(
+            fixture.claim(OutboxClaimKind::TerminalCompletionOnly, 3),
+        ));
+
+        let partial = coordinator
+            .persist_observed(
+                &mut store,
+                &fixture.lease,
+                outbox_id,
+                &fixture.intent,
+                observed_broker.observed(&fixture.intent, "partially_filled", 1),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            partial,
+            SubmissionProgress::BrokerStatePersisted { .. }
+        ));
+
+        let terminal = coordinator
+            .persist_observed(
+                &mut store,
+                &fixture.lease,
+                outbox_id,
+                &fixture.intent,
+                observed_broker.observed(&fixture.intent, "filled", 2),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            terminal,
+            SubmissionProgress::TerminalFinalized { .. }
+        ));
+
+        assert_eq!(store.durable_fills.len(), 2);
+        assert_eq!(store.broker_event_writes.len(), 2);
+        let first_a = &store.broker_event_writes[0].2[0];
+        let repeated_a = &store.broker_event_writes[1].2[0];
+        assert_eq!(
+            first_a.activity_evidence_hash,
+            repeated_a.activity_evidence_hash
+        );
+        assert_ne!(first_a.raw_payload_hash, repeated_a.raw_payload_hash);
+        assert_ne!(first_a.received_at, repeated_a.received_at);
+        assert_eq!(
+            store.durable_fills["fill-activity-1"].received_at,
+            first_a.received_at
+        );
+        assert_eq!(store.finalizations, 1);
     }
 
     #[tokio::test]
@@ -2072,7 +2250,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovered_nonzero_fill_never_fabricates_broker_or_fill_rows() {
+    async fn recovered_nonzero_fill_uses_rest_activity_and_never_reposts() {
         let fixture = Fixture::new();
         let log = Arc::new(Mutex::new(Vec::new()));
         let broker = FakeBroker::new(
@@ -2095,10 +2273,11 @@ mod tests {
             .unwrap();
         assert!(matches!(
             results.as_slice(),
-            [SubmissionProgress::FillEvidenceRequired { .. }]
+            [SubmissionProgress::BrokerStatePersisted { .. }]
         ));
         assert_eq!(*posts.lock().unwrap(), 0);
-        assert!(store.broker_event_writes.is_empty());
+        assert_eq!(store.broker_event_writes.len(), 1);
+        assert_eq!(store.broker_event_writes[0].2.len(), 1);
         assert_eq!(store.finalizations, 0);
     }
 }

@@ -25,6 +25,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     str::FromStr,
+    sync::Arc,
 };
 
 use async_trait::async_trait;
@@ -44,8 +45,9 @@ use crate::{
     lifecycle::BrokerOrderStatus,
     port::{
         BrokerPort, CancellationNotDispatched, CancellationOutcome, CancellationRequestAccepted,
-        ObservedBrokerOrder, RegularTradingSessionPermit, SubmissionNotDispatched,
-        SubmissionOutcome, MAX_SUBMISSION_RESPONSE_JSON_BYTES,
+        ObservedBrokerFill, ObservedBrokerOrder, RegularTradingSessionPermit,
+        SubmissionNotDispatched, SubmissionOutcome, MAX_FILL_ACTIVITY_RESPONSE_JSON_BYTES,
+        MAX_FILL_ACTIVITY_TRAVERSAL_JSON_BYTES, MAX_SUBMISSION_RESPONSE_JSON_BYTES,
     },
     rate_limit::RequestClass,
     ExecutionError,
@@ -175,6 +177,9 @@ pub struct PageResponseEvidence {
     pub request_parameters_hash: HashDigest,
     pub item_count: u32,
     pub completion_witness: Option<PaginationCompletionWitness>,
+    /// Exact provider bytes. Hash-only evidence is insufficient for durable
+    /// accounting reconstruction or independent schema-drift review.
+    pub raw_response_json: Option<Arc<[u8]>>,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -932,6 +937,7 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
                 request_parameters_hash,
                 item_count,
                 completion_witness: completion,
+                raw_response_json: None,
             });
 
             if let Some(completion) = completion {
@@ -961,6 +967,7 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
         let mut page_token = query.page_token.clone();
         let mut seen_activity_ids = BTreeSet::new();
         let mut seen_cursors = BTreeSet::new();
+        let mut retained_raw_bytes = 0usize;
         let mut previous_page_tail: Option<DateTime<Utc>> = None;
         if let Some(initial_token) = &page_token {
             seen_cursors.insert(initial_token.clone());
@@ -1002,6 +1009,20 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
                 .await?;
             require_status("list FILL activities", &response, 200)?;
             let evidence = evidence(&response)?;
+            retained_raw_bytes = retained_raw_bytes
+                .checked_add(response.body.len())
+                .filter(|total| *total <= MAX_FILL_ACTIVITY_TRAVERSAL_JSON_BYTES)
+                .ok_or_else(|| {
+                    ExecutionError::Broker(
+                        "FILL activity traversal exceeded its raw-evidence byte ceiling".into(),
+                    )
+                })?;
+            if response.body.len() > MAX_FILL_ACTIVITY_RESPONSE_JSON_BYTES {
+                return Err(ExecutionError::Broker(
+                    "FILL activity page exceeded its raw-evidence byte ceiling".into(),
+                ));
+            }
+            let raw_response_json = Arc::<[u8]>::from(response.body.clone());
             let raw: Vec<RawFillActivity> = parse_json("FILL activities", &response.body)?;
             if raw.len() > page_size {
                 return Err(ExecutionError::Broker(
@@ -1057,6 +1078,7 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
                 request_parameters_hash,
                 item_count,
                 completion_witness: completion,
+                raw_response_json: Some(raw_response_json),
             });
 
             // Alpaca exposes no next-page flag. A short page is the provider's
@@ -1703,6 +1725,128 @@ impl<T: HttpTransport> BrokerPort for AlpacaPaperAdapter<T> {
             order.to_broker_event(&observed.evidence),
             raw_response_json,
         )?))
+    }
+
+    async fn fills_for_order(
+        &self,
+        expected_intent: &OrderIntent,
+        provider_order_id: &str,
+        expected_cumulative_quantity: WholeQuantity,
+    ) -> Result<Vec<ObservedBrokerFill>, ExecutionError> {
+        validate_bounded_text("provider_order_id", provider_order_id, MAX_IDENTIFIER_BYTES)?;
+        if expected_cumulative_quantity == WholeQuantity::ZERO
+            || expected_cumulative_quantity > expected_intent.quantity
+        {
+            return Err(ExecutionError::Broker(
+                "requested FILL activity coverage is zero or exceeds the committed intent".into(),
+            ));
+        }
+
+        // No creation-time horizon is asserted here. Alpaca documents that the
+        // endpoint's after/until filters use activity creation time, while a
+        // FILL row exposes transaction_time. Enumerating from the beginning is
+        // bounded by the adapter page ceiling and fails closed if the account
+        // history is too large for this v1 recovery path.
+        let observed = self
+            .list_fill_activities(&FillActivityQuery::default())
+            .await?;
+        if !observed.completeness_proven() {
+            return Err(ExecutionError::Broker(
+                "complete FILL activity traversal was not proven".into(),
+            ));
+        }
+
+        let mut fills = Vec::new();
+        let mut offset = 0usize;
+        for page in &observed.page_evidence {
+            let count = usize::try_from(page.item_count).map_err(|_| {
+                ExecutionError::Broker("FILL page item count exceeded the platform range".into())
+            })?;
+            let end = offset
+                .checked_add(count)
+                .ok_or_else(|| ExecutionError::Broker("FILL page coverage overflowed".into()))?;
+            let activities = observed.value.get(offset..end).ok_or_else(|| {
+                ExecutionError::Broker(
+                    "FILL page evidence does not cover the normalized activity sequence".into(),
+                )
+            })?;
+            for activity in activities
+                .iter()
+                .filter(|activity| activity.provider_order_id == provider_order_id)
+            {
+                if activity.symbol != expected_intent.symbol
+                    || activity.side != expected_intent.side
+                {
+                    return Err(ExecutionError::Broker(
+                        "FILL activity economic identity differs from the committed intent".into(),
+                    ));
+                }
+                fills.push(ObservedBrokerFill::try_new(
+                    activity.activity_id.clone(),
+                    activity.fill_type.clone(),
+                    activity.provider_order_id.clone(),
+                    activity.symbol.clone(),
+                    activity.side,
+                    activity.quantity,
+                    activity.cumulative_quantity,
+                    activity.leaves_quantity,
+                    activity.price,
+                    activity.transaction_at,
+                    page.response.received_at,
+                    page.response.request_id.clone(),
+                    page.request_parameters_hash,
+                    page.response.raw_payload_hash,
+                    Arc::clone(page.raw_response_json.as_ref().ok_or_else(|| {
+                        ExecutionError::Broker("FILL page lacks exact raw response evidence".into())
+                    })?),
+                )?);
+            }
+            offset = end;
+        }
+        if offset != observed.value.len() {
+            return Err(ExecutionError::Broker(
+                "FILL page evidence left normalized activities uncovered".into(),
+            ));
+        }
+
+        // Provider traversal may observe fills that arrived after the order
+        // response being persisted. Order-local cumulative quantity is the
+        // stable sequencing key, so validate the complete sequence and retain
+        // only the exact prefix represented by that earlier order response.
+        fills.sort_by_key(|fill| fill.cumulative_quantity);
+        let mut cumulative = 0u64;
+        let mut prefix_len = None;
+        for (index, fill) in fills.iter().enumerate() {
+            cumulative = cumulative.checked_add(fill.quantity.get()).ok_or_else(|| {
+                ExecutionError::Broker("FILL cumulative quantity overflowed".into())
+            })?;
+            if fill.cumulative_quantity.get() != cumulative
+                || fill.leaves_quantity.get()
+                    != expected_intent
+                        .quantity
+                        .get()
+                        .checked_sub(cumulative)
+                        .ok_or_else(|| {
+                            ExecutionError::Broker(
+                                "FILL quantities exceed the committed intent".into(),
+                            )
+                        })?
+            {
+                return Err(ExecutionError::Broker(
+                    "FILL activity cumulative/leaves sequence is inconsistent".into(),
+                ));
+            }
+            if fill.cumulative_quantity == expected_cumulative_quantity {
+                prefix_len = Some(index + 1);
+            }
+        }
+        let Some(prefix_len) = prefix_len else {
+            return Err(ExecutionError::Broker(
+                "stable FILL activities do not contain the observed cumulative quantity".into(),
+            ));
+        };
+        fills.truncate(prefix_len);
+        Ok(fills)
     }
 
     async fn find_order_by_provider_id(
@@ -3663,6 +3807,88 @@ mod tests {
             transport.requests()[0].url,
             "https://paper-api.alpaca.markets/v2/account/activities/FILL?direction=asc&page_size=100&page_token=prior%3A%3Aactivity"
         );
+    }
+
+    #[tokio::test]
+    async fn order_fill_recovery_uses_stable_activity_identity_not_page_grouping() {
+        let fill = fill_json("activity-1::fill", "2026-07-20T13:30:00Z");
+        let mut unrelated = fill_json("other-activity::fill", "2026-07-20T13:30:00Z");
+        unrelated["order_id"] = json!("other-order");
+        let transport = FakeTransport::with_outcomes(vec![
+            Ok(response(200, json!([fill.clone()]))),
+            Ok(response(200, json!([unrelated, fill]))),
+        ]);
+        let adapter = adapter(transport);
+        let intent = intent();
+
+        let first = adapter
+            .fills_for_order(&intent, "order-1", WholeQuantity::new(1))
+            .await
+            .unwrap();
+        let regrouped = adapter
+            .fills_for_order(&intent, "order-1", WholeQuantity::new(1))
+            .await
+            .unwrap();
+
+        assert_eq!(first.len(), 1);
+        assert_eq!(regrouped.len(), 1);
+        assert_eq!(first[0].fill_id, "activity-1::fill");
+        assert_eq!(
+            first[0].activity_evidence_hash,
+            regrouped[0].activity_evidence_hash
+        );
+        assert_ne!(first[0].raw_payload_hash, regrouped[0].raw_payload_hash);
+    }
+
+    #[tokio::test]
+    async fn order_fill_recovery_selects_exact_prefix_and_rejects_missing_sequence() {
+        let first = fill_json("activity-1::partial", "2026-07-20T13:30:00Z");
+        let mut second = fill_json("activity-2::fill", "2026-07-20T13:30:01Z");
+        second["type"] = json!("fill");
+        second["cum_qty"] = json!("2");
+        second["leaves_qty"] = json!("0");
+        let transport = FakeTransport::with_outcomes(vec![
+            Ok(response(200, json!([first.clone(), second.clone()]))),
+            Ok(response(200, json!([first.clone(), second]))),
+            Ok(response(200, json!([first]))),
+        ]);
+        let adapter = adapter(transport);
+        let intent = intent();
+
+        // A second fill may arrive between the order response and the FILL
+        // activity read. Persist the exact prefix represented by the order
+        // response rather than rejecting safe evidence as a race.
+        let partial = adapter
+            .fills_for_order(&intent, "order-1", WholeQuantity::new(1))
+            .await
+            .unwrap();
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial[0].fill_id, "activity-1::partial");
+
+        let complete = adapter
+            .fills_for_order(&intent, "order-1", WholeQuantity::new(2))
+            .await
+            .unwrap();
+        assert_eq!(complete.len(), 2);
+        assert!(adapter
+            .fills_for_order(&intent, "order-1", WholeQuantity::new(2))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn order_fill_recovery_rejects_fill_type_that_disagrees_with_leaves() {
+        let mut invalid = fill_json("activity-1::fill", "2026-07-20T13:30:00Z");
+        invalid["type"] = json!("fill");
+        let adapter = adapter(FakeTransport::with_outcomes(vec![Ok(response(
+            200,
+            json!([invalid]),
+        ))]));
+
+        assert!(adapter
+            .fills_for_order(&intent(), "order-1", WholeQuantity::new(1))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

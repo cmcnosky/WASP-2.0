@@ -236,7 +236,7 @@ docker exec --env PGAPPNAME=fill_race_writer "$container_name" psql \
   --username "$database_user" \
   --dbname "$database_name" \
   --set=ON_ERROR_STOP=1 \
-  --command="BEGIN; INSERT INTO fills (fill_id, broker_order_id, intent_id, symbol, side, quantity, price, executed_at, received_at, raw_hash) VALUES ('fill-race-1', 'broker-confirmed-test', '73000000-0000-0000-0000-000000000001', 'SPY', 'buy', 1, 500, clock_timestamp(), clock_timestamp(), repeat('b', 64)); SELECT pg_sleep(2); COMMIT;" >/dev/null &
+  --command="BEGIN; INSERT INTO fills (fill_id, broker_order_id, intent_id, symbol, side, quantity, price, executed_at, received_at, raw_hash) VALUES ('fill-race-1', 'broker-confirmed-test', '73000000-0000-0000-0000-000000000001', 'SPY', 'buy', 1, 500, clock_timestamp(), clock_timestamp(), repeat('b', 64)); INSERT INTO fill_activity_evidence (fill_id, activity_evidence_hash) VALUES ('fill-race-1', repeat('d', 64)); SELECT pg_sleep(2); COMMIT;" >/dev/null &
 fill_writer_pid=$!
 
 if ! wait_for_database_sleep fill_race_writer; then

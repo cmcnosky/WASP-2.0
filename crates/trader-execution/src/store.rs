@@ -151,6 +151,8 @@ WITH required_function(signature) AS (
         ('public.insert_order_outbox_v2(text,text,uuid,bigint,uuid,uuid,jsonb,timestamp with time zone)'),
         ('public.insert_broker_order_v2(text,text,uuid,bigint,text,uuid,text,timestamp with time zone,text)'),
         ('public.insert_fill_v2(text,text,uuid,bigint,text,text,uuid,numeric,numeric,numeric,timestamp with time zone,timestamp with time zone,text)'),
+        ('public.insert_fill_v3(text,text,uuid,bigint,text,text,uuid,numeric,numeric,numeric,timestamp with time zone,timestamp with time zone,text,text)'),
+        ('public.enforce_fill_activity_evidence()'),
         ('public.insert_broker_event_v2(text,text,uuid,bigint,uuid,text,text,text,boolean,numeric,numeric,timestamp with time zone,timestamp with time zone,text,jsonb,text)'),
         ('public.insert_account_snapshot_v2(text,text,uuid,bigint,uuid,timestamp with time zone,timestamp with time zone,text,boolean,numeric,numeric,numeric,boolean,boolean,boolean,jsonb,text)'),
         ('public.insert_reconciliation_run_v2(text,text,uuid,bigint,uuid,text,uuid,timestamp with time zone)'),
@@ -196,6 +198,7 @@ WITH required_function(signature) AS (
         ('risk_decisions'), ('order_plans'), ('order_intents'),
         ('intent_state_events'), ('order_outbox'), ('broker_orders'),
         ('broker_order_events'), ('fills'), ('account_snapshots'),
+        ('fill_activity_evidence'),
         ('reconciliation_runs'), ('reconciliation_diffs'),
         ('runtime_schema_attestations'), ('cancel_intents'),
         ('cancel_state_events'), ('cancel_outbox')
@@ -287,7 +290,7 @@ WITH allowed_function(signature) AS (
         ('public.insert_intent_state_v2(text,text,uuid,bigint,uuid,uuid,text,text,jsonb,timestamp with time zone)'),
         ('public.insert_order_outbox_v2(text,text,uuid,bigint,uuid,uuid,jsonb,timestamp with time zone)'),
         ('public.insert_broker_order_v2(text,text,uuid,bigint,text,uuid,text,timestamp with time zone,text)'),
-        ('public.insert_fill_v2(text,text,uuid,bigint,text,text,uuid,numeric,numeric,numeric,timestamp with time zone,timestamp with time zone,text)'),
+        ('public.insert_fill_v3(text,text,uuid,bigint,text,text,uuid,numeric,numeric,numeric,timestamp with time zone,timestamp with time zone,text,text)'),
         ('public.insert_broker_event_v2(text,text,uuid,bigint,uuid,text,text,text,boolean,numeric,numeric,timestamp with time zone,timestamp with time zone,text,jsonb,text)'),
         ('public.insert_account_snapshot_v2(text,text,uuid,bigint,uuid,timestamp with time zone,timestamp with time zone,text,boolean,numeric,numeric,numeric,boolean,boolean,boolean,jsonb,text)'),
         ('public.insert_reconciliation_run_v2(text,text,uuid,bigint,uuid,text,uuid,timestamp with time zone)'),
@@ -412,10 +415,23 @@ SELECT public.insert_broker_event_v2(
 )
 "#;
 const INSERT_FILL_SQL: &str = r#"
-SELECT public.insert_fill_v2(
+SELECT public.insert_fill_v3(
     $1,$2,$3,$4,$5,$6,$7,$8::text::numeric,$9::text::numeric,
-    $10::text::numeric,$11,$12,$13
+    $10::text::numeric,$11,$12,$13,$14
 )
+"#;
+const MATCH_EXISTING_FILL_SQL: &str = r#"
+SELECT
+    fill.broker_order_id = $2
+    AND fill.intent_id = $3
+    AND fill.quantity = $4::text::numeric
+    AND fill.price = $5::text::numeric
+    AND fill.fee = $6::text::numeric
+    AND fill.executed_at = $7
+    AND evidence.activity_evidence_hash = $8 AS matches
+FROM public.fills AS fill
+JOIN public.fill_activity_evidence AS evidence USING (fill_id)
+WHERE fill.fill_id = $1
 "#;
 const INSERT_ACCOUNT_SNAPSHOT_SQL: &str = r#"
 SELECT public.insert_account_snapshot_v2(
@@ -794,7 +810,12 @@ pub struct BrokerFill {
     pub fee: Money,
     pub executed_at: DateTime<Utc>,
     pub received_at: DateTime<Utc>,
+    /// Hash of the exact provider response page on the first observation.
+    /// Exact source bytes are not yet durable and remain an explicit gate.
     pub raw_payload_hash: HashDigest,
+    /// Stable canonical activity evidence, independent of response time and
+    /// REST page grouping. This, not `raw_payload_hash`, is the dedupe key.
+    pub activity_evidence_hash: HashDigest,
 }
 
 #[derive(Clone, Debug)]
@@ -2700,19 +2721,7 @@ FOR UPDATE
     for fill in write.fills {
         let existing_fill = transaction
             .query_opt(
-                r#"
-SELECT
-    broker_order_id = $2
-    AND intent_id = $3
-    AND quantity = $4::text::numeric
-    AND price = $5::text::numeric
-    AND fee = $6::text::numeric
-    AND executed_at = $7
-    AND received_at = $8
-    AND raw_hash = $9 AS matches
-FROM public.fills
-WHERE fill_id = $1
-"#,
+                MATCH_EXISTING_FILL_SQL,
                 &[
                     &fill.fill_id,
                     &prepared.broker_order_id,
@@ -2721,8 +2730,7 @@ WHERE fill_id = $1
                     &fill.price.to_string(),
                     &fill.fee.to_string(),
                     &fill.executed_at,
-                    &fill.received_at,
-                    &fill.raw_payload_hash.as_hex(),
+                    &fill.activity_evidence_hash.as_hex(),
                 ],
             )
             .await
@@ -2740,7 +2748,8 @@ WHERE fill_id = $1
             let quantity = fill.quantity.get().to_string();
             let price = fill.price.to_string();
             let fee = fill.fee.to_string();
-            let fill_hash = fill.raw_payload_hash.as_hex();
+            let fill_hash = fill.activity_evidence_hash.as_hex();
+            let raw_hash = fill.raw_payload_hash.as_hex();
             let inserted = transaction
                 .execute(
                     INSERT_FILL_SQL,
@@ -2757,6 +2766,7 @@ WHERE fill_id = $1
                         &fee,
                         &fill.executed_at,
                         &fill.received_at,
+                        &raw_hash,
                         &fill_hash,
                     ],
                 )
@@ -4779,6 +4789,13 @@ const EXPECTED_SCHEMA_COLUMNS: &[ExpectedSchemaColumn] = &[
     numeric_column!("fills", "quantity", false, 38, 6),
     numeric_column!("fills", "price", false, 38, 6),
     numeric_column!("fills", "fee", false, 38, 6),
+    column!("fill_activity_evidence", "fill_id", "text", false),
+    column!(
+        "fill_activity_evidence",
+        "activity_evidence_hash",
+        "text",
+        false
+    ),
     column!("account_snapshots", "account_snapshot_id", "uuid", false),
     numeric_column!("account_snapshots", "cash", false, 38, 6),
     numeric_column!("account_snapshots", "equity", false, 38, 6),
@@ -4972,6 +4989,14 @@ mod tests {
         assert!(FINALIZE_RECONCILIATION_SQL
             .to_ascii_uppercase()
             .contains("SELECT PUBLIC.FINALIZE_RECONCILIATION_V2"));
+    }
+
+    #[test]
+    fn stable_fill_deduplication_ignores_later_observation_time() {
+        assert!(MATCH_EXISTING_FILL_SQL.contains("executed_at = $7"));
+        assert!(MATCH_EXISTING_FILL_SQL.contains("evidence.activity_evidence_hash = $8"));
+        assert!(!MATCH_EXISTING_FILL_SQL.contains("received_at"));
+        assert!(!MATCH_EXISTING_FILL_SQL.contains("raw_hash ="));
     }
 
     #[test]
