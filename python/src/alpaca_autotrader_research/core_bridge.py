@@ -41,7 +41,7 @@ class CoreBridge:
     """Invoke Rust only; this class intentionally has no decision fallback path."""
 
     MODULE_NAME = "alpaca_autotrader_core"
-    REQUIRED_CALLS = ("evaluate_decision", "backtest")
+    REQUIRED_CALLS = ("evaluate_decision", "backtest", "materialize_order_intent")
 
     def __init__(self, module: ModuleType) -> None:
         self._module = module
@@ -87,6 +87,26 @@ class CoreBridge:
     def backtest(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         function = getattr(self._module, "backtest")
         return self._invoke(function, canonical_json_text(request))
+
+    def materialize_order_intent(
+        self,
+        *,
+        snapshot: Mapping[str, Any],
+        release: Mapping[str, Any],
+        risk_decision: Mapping[str, Any],
+        plan: Mapping[str, Any],
+        quote: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Materialize through Rust only; Python cannot construct an intent itself."""
+        function = getattr(self._module, "materialize_order_intent")
+        return self._invoke(
+            function,
+            canonical_json_text(snapshot),
+            canonical_json_text(release),
+            canonical_json_text(risk_decision),
+            canonical_json_text(plan),
+            canonical_json_text(quote),
+        )
 
     @staticmethod
     def _invoke(function: Callable[..., Any], *arguments: str) -> Mapping[str, Any]:
