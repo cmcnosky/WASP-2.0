@@ -632,6 +632,35 @@ impl StartupResult {
         &self.source_page_evidence
     }
 
+    /// Returns true only when a persisted paper observation is semantically
+    /// clean. `Blocked` alone is never sufficient: every read-only cycle is
+    /// blocked by policy, including cycles that found broker/local drift.
+    pub fn is_clean_read_only_observation(&self) -> bool {
+        let has_both_snapshot_rounds = [1_u8, 2_u8].into_iter().all(|round| {
+            self.source_page_evidence
+                .iter()
+                .any(|page| page.snapshot_round == round)
+        });
+        let reconciliation_is_clean = self.reconciliation.as_ref().is_some_and(|report| {
+            report.validate().is_ok()
+                && report.differences.is_empty()
+                && !report.may_resume_execution
+        });
+
+        self.environment == Environment::Paper
+            && self.mode == CoordinatorMode::ReconcileOnly
+            && !self.resumable
+            && self.outcome == StartupOutcome::Blocked
+            && self.failure_stage.is_none()
+            && self.broker_snapshot_stable
+            && self.reasons == [StartupReason::ReadOnlyPolicy]
+            && self.local_evidence_hash.is_some()
+            && self.broker_evidence_hashes.len() == 2
+            && self.normalized_broker_snapshots.len() == 2
+            && has_both_snapshot_rounds
+            && reconciliation_is_clean
+    }
+
     pub fn persistence_key(&self) -> Result<ObserverPersistenceKey, CoordinatorError> {
         let evidence_hash =
             HashDigest::of_json(self).map_err(|_| CoordinatorError::EvidenceHashUnavailable)?;
@@ -2029,7 +2058,110 @@ mod tests {
         assert!(reconciliation.differences.is_empty());
         assert!(!reconciliation.may_resume_execution);
         assert_eq!(result.reasons(), &[StartupReason::ReadOnlyPolicy]);
+        assert!(result.is_clean_read_only_observation());
         assert_eq!(store.persisted, vec![result]);
+    }
+
+    #[tokio::test]
+    async fn clean_observation_predicate_fails_closed_for_every_evidence_class() {
+        let config = config();
+        let snapshot = broker(&config);
+        let mut store = store(&config, local(&config));
+        let mut broker = broker_port([snapshot.clone(), snapshot]);
+        let clean = run_startup_reconciliation(&config, &mut store, &mut broker, now(), &TestClock)
+            .await
+            .unwrap();
+        assert!(clean.is_clean_read_only_observation());
+
+        let assert_dirty = |dirty: StartupResult| {
+            assert!(
+                !dirty.is_clean_read_only_observation(),
+                "mutated evidence must never be classified clean"
+            );
+        };
+
+        let mut dirty = clean.clone();
+        dirty.environment = Environment::Shadow;
+        assert_dirty(dirty);
+        let mut dirty = clean.clone();
+        dirty.resumable = true;
+        assert_dirty(dirty);
+        let mut dirty = clean.clone();
+        dirty.outcome = StartupOutcome::Failed;
+        assert_dirty(dirty);
+        let mut dirty = clean.clone();
+        dirty.failure_stage = Some(StartupFailureStage::Persistence);
+        assert_dirty(dirty);
+        let mut dirty = clean.clone();
+        dirty.broker_snapshot_stable = false;
+        assert_dirty(dirty);
+        let mut dirty = clean.clone();
+        dirty.reasons.clear();
+        assert_dirty(dirty);
+        let mut dirty = clean.clone();
+        dirty.local_evidence_hash = None;
+        assert_dirty(dirty);
+        let mut dirty = clean.clone();
+        dirty.broker_evidence_hashes.pop();
+        assert_dirty(dirty);
+        let mut dirty = clean.clone();
+        dirty.normalized_broker_snapshots.pop();
+        assert_dirty(dirty);
+        let mut dirty = clean.clone();
+        dirty
+            .source_page_evidence
+            .retain(|page| page.snapshot_round == 1);
+        assert_dirty(dirty);
+        let mut dirty = clean.clone();
+        dirty.reconciliation = None;
+        assert_dirty(dirty);
+        let mut dirty = clean.clone();
+        dirty
+            .reconciliation
+            .as_mut()
+            .unwrap()
+            .differences
+            .push(ReconciliationDifference {
+                kind: ReconciliationDifferenceKind::StatusMismatch,
+                subject: "test-drift".into(),
+                local_value: Some("local".into()),
+                broker_value: Some("broker".into()),
+                detail: "test-only reconciliation drift".into(),
+            });
+        assert_dirty(dirty);
+        let mut dirty = clean.clone();
+        dirty.reconciliation.as_mut().unwrap().may_resume_execution = true;
+        assert_dirty(dirty);
+
+        for reason in [
+            StartupReason::IndependentCashBasisMissing,
+            StartupReason::StableRestFillIdentityMissing,
+            StartupReason::CanonicalLocalOrderTruthMissing,
+            StartupReason::LocalAccountFingerprintMismatch,
+            StartupReason::BrokerAccountFingerprintMismatch,
+            StartupReason::BrokerSnapshotUnstable,
+            StartupReason::BrokerAccountNotActive,
+            StartupReason::BrokerTradingBlocked,
+            StartupReason::BrokerAccountBlocked,
+            StartupReason::BrokerTransfersBlocked,
+            StartupReason::BrokerTradeSuspendedByUser,
+            StartupReason::BrokerAccountNotUsd,
+            StartupReason::BrokerAccruedFeesNonzero,
+            StartupReason::BrokerPendingTransfers,
+            StartupReason::BrokerPositionIdentityIncomplete,
+            StartupReason::ReconciliationDifferences,
+            StartupReason::LocalProjectionUnavailable,
+            StartupReason::BrokerSnapshotUnavailable,
+            StartupReason::BrokerSnapshotTimedOut,
+            StartupReason::SourcePageEvidenceUnavailable,
+            StartupReason::EvidenceHashUnavailable,
+            StartupReason::UnresolvedOrderOutbox,
+            StartupReason::UnresolvedCancelOutbox,
+        ] {
+            let mut dirty = clean.clone();
+            dirty.reasons.push(reason);
+            assert_dirty(dirty);
+        }
     }
 
     #[tokio::test]
@@ -2050,6 +2182,7 @@ mod tests {
         assert!(result
             .reasons()
             .contains(&StartupReason::IndependentCashBasisMissing));
+        assert!(!result.is_clean_read_only_observation());
         assert!(result
             .reconciliation()
             .unwrap()
@@ -2076,6 +2209,7 @@ mod tests {
             .reasons()
             .contains(&StartupReason::BrokerAccountFingerprintMismatch));
         assert!(!result.resumable());
+        assert!(!result.is_clean_read_only_observation());
     }
 
     #[tokio::test]
