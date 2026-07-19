@@ -8,6 +8,7 @@ pub mod authority;
 pub mod config;
 pub mod coordinator;
 pub mod database;
+pub mod durable_submission;
 pub mod executor;
 pub mod http_transport;
 pub mod ledger;
