@@ -3,12 +3,14 @@
 ## Stop condition
 
 **HOLD — do not start the ECS service** until all migrations, including
-`0005_runtime_authority.sql`, and the SQL security tests pass in the target
-database; a unique login has been bound only to the `alpaca_trader_runtime`
-NOLOGIN role; and its secret is populated. Terraform creates the empty runtime
-secret but deliberately gives ECS no access to the RDS-managed master secret.
-The LOGIN name must end in the exact trust-domain suffix (`_paper` or `_live`);
-startup checks that binding before opening the ledger.
+`0005_runtime_authority.sql` and `0009_paper_observer_evidence.sql`, and the SQL
+security tests pass in the target database. An executor login must be bound only
+to `alpaca_trader_runtime`; an observer login must be bound only to
+`alpaca_trader_observer`. These are different credentials and may never be
+combined. Terraform creates the empty runtime secret but deliberately gives ECS
+no access to the RDS-managed master secret. The executor LOGIN name must end in
+the exact trust-domain suffix (`_paper` or `_live`); the observer LOGIN must end
+in `_observer_paper`. Startup checks these bindings before opening a store.
 
 ## Required runtime contract
 
@@ -37,6 +39,32 @@ objects, promote a release/permit, clear kill state, change immutable events,
 bypass a fencing token, or call ungranted functions—and can perform required
 normal runtime transactions. The environment bootstrap procedure must also test
 the actual LOGIN, not just `SET ROLE` as an administrator.
+
+## Paper observer contract
+
+The paper observer is a separate GET-only and append-only trust domain. After
+applying migration `0009`, bootstrap must create a unique non-owner LOGIN ending
+in `_observer_paper`, grant it only `alpaca_trader_observer`, and verify that it:
+
+- is an inheriting LOGIN on PostgreSQL 17 primary RDS over hostname-validated
+  TLS and owns no database, schema, relation, sequence, or function;
+- has no direct table, sequence, DDL, executor-lease, order-outbox, release,
+  permit, kill-state, or broker-mutation authority;
+- can execute only the nine reviewed paper-observer functions and select only
+  the immutable `paper_observer_schema_attestations` relation;
+- rejects any additional direct or inherited role membership; and
+- fails startup if an attested observer function, trigger, constraint, owner,
+  or grant differs from the checked migration contract.
+
+The connector consumes only the observer-prefixed database inputs:
+`OBSERVER_DATABASE_HOST`, `OBSERVER_DATABASE_PORT`,
+`OBSERVER_DATABASE_NAME`, `OBSERVER_DATABASE_USER`,
+`OBSERVER_DATABASE_PASSWORD`, `OBSERVER_DATABASE_REQUIRE_TLS`, and
+`OBSERVER_RDS_CA_BUNDLE_PEM`, plus independently reviewed host and CA digests.
+Map these from a paper-observer-specific Secrets Manager secret at deployment;
+never reuse the executor runtime secret. The current Terraform and application
+entrypoint do not yet perform that wiring, so this section is a bootstrap
+contract and does not authorize starting ECS.
 
 ## Secret population
 

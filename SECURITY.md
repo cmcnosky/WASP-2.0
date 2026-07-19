@@ -36,6 +36,15 @@ authority. The runtime requires hostname-verified TLS against the approved
 AWS-published RDS root and compares the exact bundle digest with a separately
 reviewed, nonsecret deployment value before trusting it.
 
+The paper observer must use a different non-owner login and secret. Its login
+may inherit only `alpaca_trader_observer`, never
+`alpaca_trader_runtime`. The observer role can execute only the reviewed fenced
+observer functions and can select only the immutable schema-attestation table;
+it has no broker mutation interface, order-outbox authority, execution lease,
+release promotion, activation, kill-state clearance, DDL, or direct table-write
+authority. Startup rejects extra role memberships, unexpected owned objects,
+unattested function/trigger/constraint definitions, or broader grants.
+
 ## Access and isolation
 
 Paper/research and live should use separate AWS accounts. If that is temporarily
@@ -53,6 +62,15 @@ publisher only. Its policy explicitly denies ECS task/service deployment and
 `iam:PassRole`, so a compromised CI identity cannot turn a pushed image into a
 credential-bearing task. Removing those denies is a separately reviewed
 promotion change, not an operator variable or approval-string action.
+
+The paper observer is not yet a deployable long-running runtime. Its current
+offline evidence path does not retain raw broker bodies or literal request
+parameters, and PostgreSQL does not independently recompute the Rust
+serialization hashes. A valid observer login is therefore a trusted assertion
+origin, not an independently authenticated evidence source. It also has no
+independent accounting baseline. Those limitations are fail-closed publication
+constraints, not reasons to grant the observer more authority or remove either
+Terraform deployment hold.
 
 ## Supply chain
 

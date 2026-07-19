@@ -37,7 +37,10 @@ use trader_core::{
 
 use crate::{
     config::{MARKET_DATA_API, PAPER_TRADING_API},
-    coordinator::{BrokerSnapshot, CoordinatorPortError, OrderTruth, ReadOnlyBroker},
+    coordinator::{
+        BrokerSnapshot, CoordinatorPortError, ObservedBrokerSnapshot, OrderTruth,
+        PageCompletionWitness, ReadOnlyBroker, SourcePageEvidence, SourcePageKind,
+    },
     lifecycle::BrokerOrderStatus,
     port::{
         BrokerPort, CancellationNotDispatched, CancellationOutcome, CancellationRequestAccepted,
@@ -161,12 +164,20 @@ pub struct PagedObserved<T> {
     pub value: T,
     /// Every page retains independent request/payload evidence. Combining page
     /// hashes would destroy the ability to prove exactly which response failed.
-    pub page_evidence: Vec<ResponseEvidence>,
+    pub page_evidence: Vec<PageResponseEvidence>,
     completion: PaginationCompletionWitness,
 }
 
 #[derive(Clone, Eq, PartialEq)]
-enum PaginationCompletionWitness {
+pub struct PageResponseEvidence {
+    pub response: ResponseEvidence,
+    pub request_parameters_hash: HashDigest,
+    pub item_count: u32,
+    pub completion_witness: Option<PaginationCompletionWitness>,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum PaginationCompletionWitness {
     ShortPage,
     TimestampHorizonCrossed,
 }
@@ -809,6 +820,13 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
             } else if let Some(after) = after {
                 pairs.push(("after", after.to_rfc3339_opts(SecondsFormat::AutoSi, true)));
             }
+            let request_parameters_hash =
+                HashDigest::of_json(&("wasp2/alpaca-order-page-request/v1", status, &pairs))
+                    .map_err(|_| {
+                        ExecutionError::Broker(
+                            "order-page request evidence could not be hashed".into(),
+                        )
+                    })?;
             let response = self
                 .send(
                     HttpMethod::Get,
@@ -864,21 +882,32 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
             }
             previous_page_tail = page.last().map(|order| order.submitted_at);
             before_order_id = next_cursor;
+            let item_count = u32::try_from(page.len()).map_err(|_| {
+                ExecutionError::Broker("order-page item count exceeded its bound".into())
+            })?;
             orders.extend(
                 page.into_iter()
                     .filter(|order| after.is_none_or(|cutoff| order.submitted_at > cutoff)),
             );
-            page_evidence.push(evidence);
+            let completion = if crossed_horizon {
+                Some(PaginationCompletionWitness::TimestampHorizonCrossed)
+            } else if !page_is_full {
+                Some(PaginationCompletionWitness::ShortPage)
+            } else {
+                None
+            };
+            page_evidence.push(PageResponseEvidence {
+                response: evidence,
+                request_parameters_hash,
+                item_count,
+                completion_witness: completion,
+            });
 
-            if !page_is_full || crossed_horizon {
+            if let Some(completion) = completion {
                 return Ok(PagedObserved {
                     value: orders,
                     page_evidence,
-                    completion: if crossed_horizon {
-                        PaginationCompletionWitness::TimestampHorizonCrossed
-                    } else {
-                        PaginationCompletionWitness::ShortPage
-                    },
+                    completion,
                 });
             }
             if page_index + 1 == MAX_ORDER_PAGES {
@@ -920,6 +949,13 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
             if let Some(token) = &page_token {
                 pairs.push(("page_token", token.clone()));
             }
+            let request_parameters_hash =
+                HashDigest::of_json(&("wasp2/alpaca-fill-activity-page-request/v1", &pairs))
+                    .map_err(|_| {
+                        ExecutionError::Broker(
+                            "FILL activity request evidence could not be hashed".into(),
+                        )
+                    })?;
             let url = with_query(
                 &format!("{PAPER_TRADING_API}/v2/account/activities/FILL"),
                 &pairs,
@@ -945,17 +981,9 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
                 .into_iter()
                 .map(FillActivity::try_from)
                 .collect::<Result<Vec<_>, _>>()?;
-            if query
-                .after
-                .is_some_and(|after| page.iter().any(|fill| fill.transaction_at <= after))
-                || query
-                    .until
-                    .is_some_and(|until| page.iter().any(|fill| fill.transaction_at >= until))
-            {
-                return Err(ExecutionError::Broker(
-                    "FILL activity response violated its exclusive timestamp bounds".into(),
-                ));
-            }
+            // Alpaca defines `after`/`until` against activity creation time,
+            // while FILL rows expose `transaction_time`. Do not claim that a
+            // transaction timestamp proves or violates the server-side filter.
             validate_ascending_fill_page(&page, previous_page_tail)?;
             if page_token
                 .as_ref()
@@ -988,17 +1016,26 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
                 }
             }
             previous_page_tail = page.last().map(|fill| fill.transaction_at);
+            let item_count = u32::try_from(page.len()).map_err(|_| {
+                ExecutionError::Broker("FILL activity page item count exceeded its bound".into())
+            })?;
             fills.extend(page);
-            page_evidence.push(evidence);
+            let completion = (!page_is_full).then_some(PaginationCompletionWitness::ShortPage);
+            page_evidence.push(PageResponseEvidence {
+                response: evidence,
+                request_parameters_hash,
+                item_count,
+                completion_witness: completion,
+            });
 
             // Alpaca exposes no next-page flag. A short page is the provider's
             // only completeness witness; full pages always require one more
             // request using the exact last activity ID as page_token.
-            if !page_is_full {
+            if let Some(completion) = completion {
                 return Ok(PagedObserved {
                     value: fills,
                     page_evidence,
-                    completion: PaginationCompletionWitness::ShortPage,
+                    completion,
                 });
             }
             page_token = next_cursor;
@@ -1320,7 +1357,15 @@ impl<T: HttpTransport> AlpacaPaperAdapter<T> {
 }
 
 impl<T: HttpTransport> AlpacaReadOnlyBroker<T> {
-    async fn collect_snapshot(&self) -> Result<BrokerSnapshot, ExecutionError> {
+    async fn collect_snapshot_with_evidence(
+        &self,
+        snapshot_round: u8,
+    ) -> Result<ObservedBrokerSnapshot, ExecutionError> {
+        if !matches!(snapshot_round, 1 | 2) {
+            return Err(ExecutionError::UnsafeConfiguration(
+                "read-only snapshot round must be one or two".into(),
+            ));
+        }
         let account = self.adapter.get_account().await?;
         let account_fingerprint = account
             .value
@@ -1350,14 +1395,73 @@ impl<T: HttpTransport> AlpacaReadOnlyBroker<T> {
             ));
         }
 
+        let mut pages = Vec::with_capacity(
+            2 + open_orders.page_evidence.len()
+                + closed_orders.page_evidence.len()
+                + fills.page_evidence.len(),
+        );
+        pages.push(single_source_page(
+            snapshot_round,
+            SourcePageKind::Account,
+            "wasp2/alpaca-account-request/v1",
+            &account.evidence,
+            1,
+        )?);
+        pages.push(single_source_page(
+            snapshot_round,
+            SourcePageKind::Positions,
+            "wasp2/alpaca-positions-request/v1",
+            &positions.evidence,
+            u32::try_from(positions.value.len()).map_err(|_| {
+                ExecutionError::Broker("position response item count exceeded its bound".into())
+            })?,
+        )?);
+        append_paged_source_evidence(
+            &mut pages,
+            snapshot_round,
+            SourcePageKind::OpenOrders,
+            &open_orders.page_evidence,
+        )?;
+        append_paged_source_evidence(
+            &mut pages,
+            snapshot_round,
+            SourcePageKind::ClosedOrders,
+            &closed_orders.page_evidence,
+        )?;
+        append_paged_source_evidence(
+            &mut pages,
+            snapshot_round,
+            SourcePageKind::FillActivities,
+            &fills.page_evidence,
+        )?;
+
         let mut normalized_positions = BTreeMap::new();
+        let mut position_asset_ids = BTreeMap::new();
+        let mut position_available_quantities = BTreeMap::new();
         for position in positions.value {
+            let symbol = position.symbol;
+            if position_asset_ids
+                .insert(symbol.clone(), position.provider_asset_id)
+                .is_some()
+            {
+                return Err(ExecutionError::Broker(
+                    "read-only broker snapshot repeated a position asset identity".into(),
+                ));
+            }
             if normalized_positions
-                .insert(position.symbol, position.quantity)
+                .insert(symbol.clone(), position.quantity)
                 .is_some()
             {
                 return Err(ExecutionError::Broker(
                     "read-only broker snapshot repeated a position symbol".into(),
+                ));
+            }
+            if position_available_quantities
+                .insert(symbol, position.quantity_available)
+                .is_some()
+            {
+                return Err(ExecutionError::Broker(
+                    "read-only broker snapshot repeated position availability".into(),
                 ));
             }
         }
@@ -1385,46 +1489,52 @@ impl<T: HttpTransport> AlpacaReadOnlyBroker<T> {
             .collect::<Result<Vec<_>, _>>()?;
         fill_fingerprints.sort_unstable();
 
-        let mut source_evidence_hashes = Vec::with_capacity(
-            2 + open_orders.page_evidence.len()
-                + closed_orders.page_evidence.len()
-                + fills.page_evidence.len(),
-        );
-        source_evidence_hashes.push(account.evidence.raw_payload_hash);
-        source_evidence_hashes.push(positions.evidence.raw_payload_hash);
-        source_evidence_hashes.extend(
-            open_orders
-                .page_evidence
-                .into_iter()
-                .map(|evidence| evidence.raw_payload_hash),
-        );
-        source_evidence_hashes.extend(
-            closed_orders
-                .page_evidence
-                .into_iter()
-                .map(|evidence| evidence.raw_payload_hash),
-        );
-        source_evidence_hashes.extend(
-            fills
-                .page_evidence
-                .into_iter()
-                .map(|evidence| evidence.raw_payload_hash),
-        );
+        let source_evidence_hashes = pages
+            .iter()
+            .map(|evidence| evidence.raw_payload_hash)
+            .collect();
 
-        Ok(BrokerSnapshot {
-            account_fingerprint,
-            account_status: map_account_status(&account.value.status),
-            trading_blocked: account.value.trading_blocked,
-            account_blocked: account.value.account_blocked,
-            transfers_blocked: account.value.transfers_blocked,
-            trade_suspended_by_user: account.value.trade_suspended_by_user,
-            usd_currency: account.value.currency == "USD",
-            cash: account.value.cash,
-            positions: normalized_positions,
-            orders,
-            fill_fingerprints,
-            source_evidence_hashes,
+        Ok(ObservedBrokerSnapshot {
+            snapshot: BrokerSnapshot {
+                account_fingerprint,
+                account_status: map_account_status(&account.value.status),
+                trading_blocked: account.value.trading_blocked,
+                account_blocked: account.value.account_blocked,
+                transfers_blocked: account.value.transfers_blocked,
+                trade_suspended_by_user: account.value.trade_suspended_by_user,
+                usd_currency: account.value.currency == "USD",
+                cash: account.value.cash,
+                buying_power: account.value.buying_power,
+                non_marginable_buying_power: account.value.non_marginable_buying_power,
+                equity: account.value.equity,
+                last_equity: account.value.last_equity,
+                portfolio_value: account.value.portfolio_value,
+                long_market_value: account.value.long_market_value,
+                short_market_value: account.value.short_market_value,
+                accrued_fees: account.value.accrued_fees,
+                pending_transfer_in: account.value.pending_transfer_in,
+                pending_transfer_out: account.value.pending_transfer_out,
+                initial_margin: account.value.initial_margin,
+                maintenance_margin: account.value.maintenance_margin,
+                last_maintenance_margin: account.value.last_maintenance_margin,
+                regt_buying_power: account.value.regt_buying_power,
+                multiplier: account.value.multiplier,
+                shorting_enabled: account.value.shorting_enabled,
+                positions: normalized_positions,
+                position_asset_ids,
+                position_available_quantities,
+                orders,
+                fill_fingerprints,
+                source_evidence_hashes,
+            },
+            pages,
         })
+    }
+
+    async fn collect_snapshot(&self) -> Result<BrokerSnapshot, ExecutionError> {
+        self.collect_snapshot_with_evidence(1)
+            .await
+            .map(|observed| observed.snapshot)
     }
 }
 
@@ -1432,6 +1542,15 @@ impl<T: HttpTransport> AlpacaReadOnlyBroker<T> {
 impl<T: HttpTransport> ReadOnlyBroker for AlpacaReadOnlyBroker<T> {
     async fn read_snapshot(&mut self) -> Result<BrokerSnapshot, CoordinatorPortError> {
         self.collect_snapshot()
+            .await
+            .map_err(|_| read_only_snapshot_error())
+    }
+
+    async fn read_snapshot_with_evidence(
+        &mut self,
+        snapshot_round: u8,
+    ) -> Result<ObservedBrokerSnapshot, CoordinatorPortError> {
+        self.collect_snapshot_with_evidence(snapshot_round)
             .await
             .map_err(|_| read_only_snapshot_error())
     }
@@ -2066,6 +2185,109 @@ struct FillFingerprintMaterial<'a> {
     leaves_quantity: WholeQuantity,
     price: Price,
     transaction_at: DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+struct SourcePageHashMaterial<'a> {
+    schema: &'static str,
+    snapshot_round: u8,
+    kind: SourcePageKind,
+    page_ordinal: u32,
+    request_parameters_hash: HashDigest,
+    request_id: &'a Option<String>,
+    raw_payload_hash: HashDigest,
+    received_at: DateTime<Utc>,
+    item_count: u32,
+    completion_witness: Option<PageCompletionWitness>,
+}
+
+fn single_source_page(
+    snapshot_round: u8,
+    kind: SourcePageKind,
+    request_schema: &'static str,
+    response: &ResponseEvidence,
+    item_count: u32,
+) -> Result<SourcePageEvidence, ExecutionError> {
+    let request_parameters_hash = HashDigest::of_json(&(request_schema, "no-query-parameters"))
+        .map_err(|_| {
+            ExecutionError::Broker("single-page request evidence could not be hashed".into())
+        })?;
+    source_page(
+        snapshot_round,
+        kind,
+        0,
+        request_parameters_hash,
+        response,
+        item_count,
+        Some(PageCompletionWitness::Single),
+    )
+}
+
+fn append_paged_source_evidence(
+    output: &mut Vec<SourcePageEvidence>,
+    snapshot_round: u8,
+    kind: SourcePageKind,
+    pages: &[PageResponseEvidence],
+) -> Result<(), ExecutionError> {
+    for (ordinal, page) in pages.iter().enumerate() {
+        let page_ordinal = u32::try_from(ordinal)
+            .map_err(|_| ExecutionError::Broker("broker page ordinal exceeded its bound".into()))?;
+        let completion_witness = page.completion_witness.map(|witness| match witness {
+            PaginationCompletionWitness::ShortPage => PageCompletionWitness::ShortPage,
+            PaginationCompletionWitness::TimestampHorizonCrossed => {
+                PageCompletionWitness::TimestampHorizonCrossed
+            }
+        });
+        output.push(source_page(
+            snapshot_round,
+            kind,
+            page_ordinal,
+            page.request_parameters_hash,
+            &page.response,
+            page.item_count,
+            completion_witness,
+        )?);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn source_page(
+    snapshot_round: u8,
+    kind: SourcePageKind,
+    page_ordinal: u32,
+    request_parameters_hash: HashDigest,
+    response: &ResponseEvidence,
+    item_count: u32,
+    completion_witness: Option<PageCompletionWitness>,
+) -> Result<SourcePageEvidence, ExecutionError> {
+    let material = SourcePageHashMaterial {
+        schema: "wasp2/alpaca-source-page-evidence/v1",
+        snapshot_round,
+        kind,
+        page_ordinal,
+        request_parameters_hash,
+        request_id: &response.request_id,
+        raw_payload_hash: response.raw_payload_hash,
+        received_at: response.received_at,
+        item_count,
+        completion_witness,
+    };
+    let evidence_hash = HashDigest::of_json(&material).map_err(|_| {
+        ExecutionError::Broker("broker source-page evidence could not be hashed".into())
+    })?;
+    Ok(SourcePageEvidence {
+        snapshot_round,
+        kind,
+        page_ordinal,
+        request_parameters_hash,
+        request_id: response.request_id.clone(),
+        raw_payload_hash: response.raw_payload_hash,
+        received_at: response.received_at,
+        item_count,
+        completion_witness,
+        evidence_hash,
+    })
 }
 
 fn normalize_snapshot_orders(
@@ -2936,7 +3158,31 @@ mod tests {
         let mut broker = AlpacaReadOnlyBroker::new(adapter(transport.clone()), vec![9_u8; 32])
             .expect("valid secret salt should construct the narrow port");
 
-        let snapshot = broker.read_snapshot().await.unwrap();
+        let observed = broker.read_snapshot_with_evidence(2).await.unwrap();
+        assert_eq!(observed.pages.len(), 5);
+        assert!(observed
+            .pages
+            .iter()
+            .all(|page| page.snapshot_round == 2
+                && page.request_id.as_deref() == Some("request-123")));
+        assert_eq!(observed.pages[0].kind, SourcePageKind::Account);
+        assert_eq!(observed.pages[0].item_count, 1);
+        assert_eq!(
+            observed.pages[0].completion_witness,
+            Some(PageCompletionWitness::Single)
+        );
+        assert_eq!(observed.pages[1].kind, SourcePageKind::Positions);
+        assert_eq!(observed.pages[1].item_count, 1);
+        assert_eq!(observed.pages[2].kind, SourcePageKind::OpenOrders);
+        assert_eq!(
+            observed.pages[2].completion_witness,
+            Some(PageCompletionWitness::ShortPage)
+        );
+        assert!(observed
+            .pages
+            .iter()
+            .all(|page| page.evidence_hash != page.raw_payload_hash));
+        let snapshot = observed.snapshot;
 
         assert_eq!(snapshot.account_status, AccountStatus::Active);
         assert!(snapshot.usd_currency);
@@ -2945,6 +3191,13 @@ mod tests {
             snapshot.positions,
             BTreeMap::from([(Symbol::new("SPY").unwrap(), WholeQuantity::new(2))])
         );
+        assert_eq!(
+            snapshot.position_asset_ids,
+            BTreeMap::from([(Symbol::new("SPY").unwrap(), "asset-1".into())])
+        );
+        assert_eq!(snapshot.accrued_fees, Money::ZERO);
+        assert_eq!(snapshot.pending_transfer_in, Money::ZERO);
+        assert_eq!(snapshot.pending_transfer_out, Money::ZERO);
         assert_eq!(snapshot.orders.len(), 2);
         assert_eq!(snapshot.orders["client-1"].status, "new");
         assert_eq!(snapshot.orders["client-1"].symbol.as_str(), "SPY");
@@ -2979,6 +3232,9 @@ mod tests {
         account["transfers_blocked"] = json!(true);
         account["account_blocked"] = json!(true);
         account["trade_suspended_by_user"] = json!(true);
+        account["accrued_fees"] = json!("0.01");
+        account["pending_transfer_in"] = json!("25.00");
+        account["pending_transfer_out"] = json!("5.00");
         let transport = FakeTransport::with_outcomes(vec![
             Ok(response(200, account)),
             Ok(response(200, json!([]))),
@@ -2996,6 +3252,9 @@ mod tests {
         assert!(snapshot.account_blocked);
         assert!(snapshot.trade_suspended_by_user);
         assert!(!snapshot.usd_currency);
+        assert_eq!(snapshot.accrued_fees, "0.01".parse().unwrap());
+        assert_eq!(snapshot.pending_transfer_in, "25.00".parse().unwrap());
+        assert_eq!(snapshot.pending_transfer_out, "5.00".parse().unwrap());
     }
 
     #[tokio::test]
@@ -3306,7 +3565,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fill_activity_response_must_obey_exclusive_timestamp_bounds() {
+    async fn fill_activity_creation_time_filters_are_not_inferred_from_transaction_time() {
         let boundary = "2026-07-20T13:30:00Z".parse().unwrap();
         let body = json!([fill_json(
             "20260720000000000::fill-1",
@@ -3324,14 +3583,14 @@ mod tests {
                 ..FillActivityQuery::default()
             })
             .await
-            .is_err());
+            .is_ok());
         assert!(adapter
             .list_fill_activities(&FillActivityQuery {
                 until: Some(boundary),
                 ..FillActivityQuery::default()
             })
             .await
-            .is_err());
+            .is_ok());
     }
 
     #[tokio::test]

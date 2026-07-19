@@ -29,6 +29,8 @@ pub fn reconcile(input: ReconciliationInput) -> ReconciliationReport {
         differences.push(ReconciliationDifference {
             kind: ReconciliationDifferenceKind::CashMismatch,
             subject: "cash".into(),
+            local_value: Some(input.local_cash.to_string()),
+            broker_value: Some(input.broker_cash.to_string()),
             detail: format!("local={} broker={}", input.local_cash, input.broker_cash),
         });
     }
@@ -37,11 +39,15 @@ pub fn reconcile(input: ReconciliationInput) -> ReconciliationReport {
             None if *local != WholeQuantity::ZERO => differences.push(ReconciliationDifference {
                 kind: ReconciliationDifferenceKind::MissingAtBroker,
                 subject: symbol.to_string(),
+                local_value: Some(local.get().to_string()),
+                broker_value: None,
                 detail: format!("local quantity {}", local.get()),
             }),
             Some(broker) if broker != local => differences.push(ReconciliationDifference {
                 kind: ReconciliationDifferenceKind::QuantityMismatch,
                 subject: symbol.to_string(),
+                local_value: Some(local.get().to_string()),
+                broker_value: Some(broker.get().to_string()),
                 detail: format!("local={} broker={}", local.get(), broker.get()),
             }),
             _ => {}
@@ -52,6 +58,8 @@ pub fn reconcile(input: ReconciliationInput) -> ReconciliationReport {
             differences.push(ReconciliationDifference {
                 kind: ReconciliationDifferenceKind::MissingLocally,
                 subject: symbol.to_string(),
+                local_value: None,
+                broker_value: Some(broker.get().to_string()),
                 detail: format!("broker quantity {}", broker.get()),
             });
         }
@@ -64,6 +72,8 @@ pub fn reconcile(input: ReconciliationInput) -> ReconciliationReport {
             differences.push(ReconciliationDifference {
                 kind: ReconciliationDifferenceKind::UnknownProviderState,
                 subject: client_id.clone(),
+                local_value: Some(local.clone()),
+                broker_value: input.broker_order_statuses.get(client_id).cloned(),
                 detail: format!("unrecognized local order status {local}"),
             });
             continue;
@@ -72,6 +82,8 @@ pub fn reconcile(input: ReconciliationInput) -> ReconciliationReport {
             None => differences.push(ReconciliationDifference {
                 kind: ReconciliationDifferenceKind::MissingAtBroker,
                 subject: client_id.clone(),
+                local_value: Some(local.clone()),
+                broker_value: None,
                 detail: format!("local status {local}"),
             }),
             Some(broker)
@@ -83,12 +95,16 @@ pub fn reconcile(input: ReconciliationInput) -> ReconciliationReport {
                 differences.push(ReconciliationDifference {
                     kind: ReconciliationDifferenceKind::UnknownProviderState,
                     subject: client_id.clone(),
+                    local_value: Some(local.clone()),
+                    broker_value: Some(broker.clone()),
                     detail: format!("unrecognized broker order status {broker}"),
                 })
             }
             Some(broker) if broker != local => differences.push(ReconciliationDifference {
                 kind: ReconciliationDifferenceKind::StatusMismatch,
                 subject: client_id.clone(),
+                local_value: Some(local.clone()),
+                broker_value: Some(broker.clone()),
                 detail: format!("local={local} broker={broker}"),
             }),
             _ => {}
@@ -106,6 +122,8 @@ pub fn reconcile(input: ReconciliationInput) -> ReconciliationReport {
                     ReconciliationDifferenceKind::MissingLocally
                 },
                 subject: client_id.clone(),
+                local_value: None,
+                broker_value: Some(broker.clone()),
                 detail: format!("broker status {broker}"),
             });
         }
@@ -134,6 +152,8 @@ pub fn reconcile(input: ReconciliationInput) -> ReconciliationReport {
                     ReconciliationDifferenceKind::MissingAtBroker
                 },
                 subject: format!("fill:{fingerprint}"),
+                local_value: Some(local.to_string()),
+                broker_value: Some(broker.to_string()),
                 detail: format!("local_count={local} broker_count={broker}"),
             });
         }

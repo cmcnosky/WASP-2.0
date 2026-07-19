@@ -69,6 +69,30 @@ execution or infrastructure.
 8. Broker events append before projections change. Only fill events change cash,
    positions, and P&L.
 
+## Read-only paper observer boundary
+
+Before any paper executor exists, a separate observer trust domain exercises
+only GET-based reconciliation. Its dedicated database login inherits only the
+`alpaca_trader_observer` role and cannot inherit the executor runtime role.
+The observer acquires its own fenced lease, reads a deliberately conservative
+projection, captures two normalized broker snapshots, and appends a blocked or
+failed cycle result. The result contract has no value representing permission to
+trade: paper observer results are structurally fixed to reconcile-only and
+`resumable=false`.
+
+The database re-attests the reviewed observer functions, triggers, constraints,
+and role ownership before the Rust store accepts a session. Completion triggers
+bind the local domain hash, normalized snapshots, source-page evidence,
+reconciliation differences, and their manifests to the result payload. This is
+an audit checkpoint, not an accounting or broker-compatibility claim. The
+current database verifies row/payload agreement and manifest membership, but it
+does not independently recompute the Rust serialization hashes or authenticate
+provider content; the authenticated observer process is the assertion origin.
+These hash-only assertions cannot qualify a strategy or authorize execution.
+Until canonical bytes, raw provider responses, and literal request parameters
+are retained and the local cash/fill/order bases are independently
+reconstructed, every observer cycle is expected to remain blocked.
+
 ## Runtime modes
 
 - `read_only`: ingest and reconcile without broker mutation; every deployment
