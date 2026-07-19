@@ -1,0 +1,17 @@
+environment             = "paper"
+expected_aws_account_id = "111111111111"
+aws_region              = "us-east-1"
+
+vpc_cidr                   = "10.42.0.0/16"
+public_subnet_cidrs         = ["10.42.0.0/24", "10.42.1.0/24"]
+private_app_subnet_cidrs    = ["10.42.10.0/24", "10.42.11.0/24"]
+private_db_subnet_cidrs     = ["10.42.20.0/24", "10.42.21.0/24"]
+
+github_repository         = "OWNER/REPOSITORY"
+container_image_digest    = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+execution_mode            = "read_only"
+deploy_application        = false
+alert_email               = null
+create_account_budget     = false
+
+# No broker, cloud, database, signing, or personal credentials belong here.

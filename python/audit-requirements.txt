@@ -1,0 +1,3 @@
+# The research package deliberately has no runtime PyPI dependencies.
+# Audit its isolated PEP 517 build dependency explicitly.
+setuptools==83.0.0

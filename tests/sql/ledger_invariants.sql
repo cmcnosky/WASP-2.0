@@ -1,0 +1,779 @@
+\set ON_ERROR_STOP on
+
+INSERT INTO strategy_releases (
+    release_id, name, version, release_hash, code_hash, parameters_hash, universe_hash,
+    data_hash, cost_model_hash, certificate_hash, status, valid_from, valid_until
+) VALUES (
+    '30000000-0000-0000-0000-000000000001',
+    'test-release',
+    '0.0.1',
+    repeat('9', 64),
+    repeat('a', 64),
+    repeat('b', 64),
+    repeat('c', 64),
+    repeat('d', 64),
+    repeat('e', 64),
+    repeat('f', 64),
+    'certified',
+    '2026-07-18T00:00:00Z',
+    '2026-08-18T00:00:00Z'
+);
+
+INSERT INTO activation_permits (
+    permit_id, environment, account_fingerprint, strategy_release_id, strategy_release_hash,
+    max_gross_notional, max_position_notional, max_daily_loss, max_drawdown,
+    risk_limits_hash, issued_at, expires_at, operator_subject, approval_digest
+) VALUES (
+    '40000000-0000-0000-0000-000000000001',
+    'paper',
+    'acct-test',
+    '30000000-0000-0000-0000-000000000001',
+    repeat('9', 64),
+    500.00,
+    500.00,
+    25.00,
+    100.00,
+    repeat('0', 64),
+    '2026-07-18T00:00:00Z',
+    '2026-08-18T00:00:00Z',
+    'operator-test',
+    repeat('1', 64)
+);
+
+INSERT INTO kill_events (
+    kill_event_id, environment, account_fingerprint, severity,
+    reason_code, detail, actor, operator_approved, approval_digest, occurred_at
+) VALUES (
+    '50000000-0000-0000-0000-000000000001',
+    'paper',
+    'acct-test',
+    'hard',
+    'TEST_HALT',
+    '{"test":true}',
+    'test-suite',
+    FALSE,
+    NULL,
+    '2026-07-18T00:00:00Z'
+);
+
+DO $$
+DECLARE
+    v_severity TEXT;
+BEGIN
+    SELECT severity INTO v_severity
+    FROM current_kill_state
+    WHERE environment = 'paper' AND account_fingerprint = 'acct-test';
+
+    IF v_severity <> 'hard' THEN
+        RAISE EXCEPTION 'expected current hard kill state, got %', v_severity;
+    END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+    BEGIN
+        UPDATE activation_permits
+        SET max_gross_notional = 999.00
+        WHERE permit_id = '40000000-0000-0000-0000-000000000001';
+        RAISE EXCEPTION 'immutable activation permit was rewritten';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM = 'immutable activation permit was rewritten' THEN
+                RAISE;
+            END IF;
+    END;
+END;
+$$;
+
+DO $$
+DECLARE
+    v_token BIGINT;
+    v_competing_token BIGINT;
+    v_renewed BOOLEAN;
+BEGIN
+    v_token := acquire_executor_lease(
+        'paper',
+        'lease-test',
+        '60000000-0000-0000-0000-000000000001',
+        INTERVAL '15 seconds'
+    );
+    IF v_token <> 1 THEN
+        RAISE EXCEPTION 'expected initial fencing token 1, got %', v_token;
+    END IF;
+
+    v_competing_token := acquire_executor_lease(
+        'paper',
+        'lease-test',
+        '60000000-0000-0000-0000-000000000002',
+        INTERVAL '15 seconds'
+    );
+    IF v_competing_token IS NOT NULL THEN
+        RAISE EXCEPTION 'competing owner acquired active lease';
+    END IF;
+
+    v_renewed := renew_executor_lease(
+        'paper',
+        'lease-test',
+        '60000000-0000-0000-0000-000000000001',
+        v_token,
+        INTERVAL '15 seconds'
+    );
+    IF NOT v_renewed THEN
+        RAISE EXCEPTION 'valid owner could not renew lease';
+    END IF;
+
+    v_renewed := renew_executor_lease(
+        'paper',
+        'lease-test',
+        '60000000-0000-0000-0000-000000000001',
+        v_token + 1,
+        INTERVAL '15 seconds'
+    );
+    IF v_renewed THEN
+        RAISE EXCEPTION 'stale fencing token renewed lease';
+    END IF;
+END;
+$$;
+
+INSERT INTO activation_permits (
+    permit_id, environment, account_fingerprint, strategy_release_id, strategy_release_hash,
+    max_gross_notional, max_position_notional, max_daily_loss, max_drawdown,
+    risk_limits_hash, issued_at, expires_at, operator_subject, approval_digest
+) VALUES (
+    '40000000-0000-0000-0000-000000000002',
+    'paper',
+    'lease-test',
+    '30000000-0000-0000-0000-000000000001',
+    repeat('9', 64),
+    500.00,
+    500.00,
+    25.00,
+    100.00,
+    repeat('5', 64),
+    '2026-07-18T00:00:00Z',
+    '2026-08-18T00:00:00Z',
+    'operator-test',
+    repeat('9', 64)
+);
+
+INSERT INTO kill_events (
+    kill_event_id, environment, account_fingerprint, severity,
+    reason_code, detail, actor, operator_approved, approval_digest, occurred_at
+) VALUES (
+    '50000000-0000-0000-0000-000000000004',
+    'paper',
+    'lease-test',
+    'clear',
+    'TEST_INITIAL_AUTHORITY',
+    '{}',
+    'operator-test',
+    TRUE,
+    repeat('a', 64),
+    clock_timestamp()
+);
+
+INSERT INTO account_snapshots (
+    account_snapshot_id, environment, account_fingerprint, broker_timestamp,
+    received_at, account_status, recognized_status, cash, equity, buying_power,
+    trading_blocked, transfers_blocked, account_blocked, payload, payload_hash
+) VALUES (
+    '75500000-0000-0000-0000-000000000001',
+    'paper',
+    'lease-test',
+    clock_timestamp(),
+    clock_timestamp(),
+    'ACTIVE',
+    TRUE,
+    10000.00,
+    10000.00,
+    10000.00,
+    FALSE,
+    FALSE,
+    FALSE,
+    '{}',
+    repeat('b', 64)
+);
+
+INSERT INTO reconciliation_runs (
+    reconciliation_id, environment, account_fingerprint, trigger,
+    kill_event_id, fencing_token, started_at
+) VALUES (
+    '76000000-0000-0000-0000-000000000001',
+    'paper',
+    'lease-test',
+    'startup',
+    '50000000-0000-0000-0000-000000000004',
+    1,
+    clock_timestamp() - INTERVAL '100 milliseconds'
+);
+
+UPDATE reconciliation_runs
+SET completed_at = clock_timestamp(),
+    outcome = 'clean',
+    resumable = TRUE,
+    account_snapshot_id = '75500000-0000-0000-0000-000000000001',
+    evidence_hash = repeat('b', 64)
+WHERE reconciliation_id = '76000000-0000-0000-0000-000000000001';
+
+INSERT INTO decision_snapshots (
+    decision_id, strategy_release_id, environment, account_fingerprint,
+    market_session, as_of, input_data_hash, account_snapshot_hash, payload
+) VALUES (
+    '70000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    'paper',
+    'lease-test',
+    '2026-07-18',
+    '2026-07-18T20:00:00Z',
+    repeat('2', 64),
+    repeat('3', 64),
+    '{}'
+);
+
+INSERT INTO target_portfolios (
+    target_portfolio_id, decision_id, strategy_release_id, reason_code, payload_hash
+) VALUES (
+    '71000000-0000-0000-0000-000000000001',
+    '70000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    'TEST_TARGET',
+    repeat('4', 64)
+);
+
+INSERT INTO target_positions (
+    target_portfolio_id, symbol, target_quantity, target_weight, reason_code
+) VALUES (
+    '71000000-0000-0000-0000-000000000001',
+    'SPY',
+    1,
+    1,
+    'TEST_TARGET'
+);
+
+INSERT INTO risk_decisions (
+    risk_decision_id, target_portfolio_id, activation_permit_id, outcome, reason_codes,
+    limit_snapshot, limit_snapshot_hash, decided_at
+) VALUES (
+    '72000000-0000-0000-0000-000000000001',
+    '71000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000002',
+    'approved',
+    ARRAY['TEST_APPROVAL'],
+    '{}',
+    repeat('5', 64),
+    '2026-07-18T20:00:01Z'
+);
+
+INSERT INTO order_plans (
+    order_plan_id, risk_decision_id, strategy_release_id, symbol, side,
+    whole_quantity, decision_reference_price, decision_evidence_hash, created_at
+) VALUES (
+    '72500000-0000-0000-0000-000000000001',
+    '72000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    'SPY',
+    'buy',
+    1,
+    499.00,
+    repeat('6', 64),
+    '2026-07-18T20:00:00Z'
+);
+
+INSERT INTO order_intents (
+    intent_id, order_plan_id, risk_decision_id, strategy_release_id, environment,
+    account_fingerprint, client_order_id, symbol, side, whole_quantity,
+    order_type, limit_price, time_in_force, decision_at, arrival_quote,
+    quote_provider_at, quote_received_at, quote_valid_until,
+    quote_payload_hash, evidence_hash
+) VALUES (
+    '73000000-0000-0000-0000-000000000001',
+    '72500000-0000-0000-0000-000000000001',
+    '72000000-0000-0000-0000-000000000001',
+    '30000000-0000-0000-0000-000000000001',
+    'paper',
+    'lease-test',
+    'test-73000000000000000000000000000001',
+    'SPY',
+    'buy',
+    1,
+    'limit',
+    500.00,
+    'day',
+    '2026-07-18T20:00:00Z',
+    499.50,
+    clock_timestamp() - INTERVAL '2 seconds',
+    clock_timestamp() - INTERVAL '1 second',
+    clock_timestamp() + INTERVAL '10 seconds',
+    repeat('d', 64),
+    repeat('6', 64)
+);
+
+INSERT INTO intent_state_events (
+    intent_state_event_id, intent_id, state, reason_code,
+    detail, fencing_token, occurred_at
+) VALUES (
+    '73500000-0000-0000-0000-000000000001',
+    '73000000-0000-0000-0000-000000000001',
+    'persisted',
+    'TEST_INTENT_PERSISTED',
+    '{}',
+    1,
+    clock_timestamp()
+), (
+    '73500000-0000-0000-0000-000000000002',
+    '73000000-0000-0000-0000-000000000001',
+    'eligible',
+    'TEST_INTENT_ELIGIBLE',
+    '{}',
+    1,
+    clock_timestamp()
+);
+
+INSERT INTO order_outbox (
+    outbox_id, intent_id, environment, account_fingerprint,
+    created_fencing_token, payload, available_at
+) VALUES (
+    '74000000-0000-0000-0000-000000000001',
+    '73000000-0000-0000-0000-000000000001',
+    'paper',
+    'lease-test',
+    1,
+    '{"client_order_id":"test-73000000000000000000000000000001"}',
+    clock_timestamp() - INTERVAL '1 second'
+);
+
+DO $$
+DECLARE
+    v_rows INTEGER;
+BEGIN
+    SELECT COUNT(*) INTO v_rows
+    FROM claim_order_outbox(
+        '74000000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001',
+        1
+    );
+    IF v_rows <> 1 THEN
+        RAISE EXCEPTION 'active executor could not claim durable outbox item';
+    END IF;
+END;
+$$;
+
+DO $$
+DECLARE
+    v_state TEXT;
+    v_rows INTEGER;
+BEGIN
+    SELECT state INTO v_state
+    FROM current_intent_states
+    WHERE intent_id = '73000000-0000-0000-0000-000000000001';
+    IF v_state <> 'dispatch_started' THEN
+        RAISE EXCEPTION 'outbox claim did not atomically record first dispatch';
+    END IF;
+
+    UPDATE order_outbox
+    SET claimed_at = clock_timestamp() - INTERVAL '31 seconds'
+    WHERE outbox_id = '74000000-0000-0000-0000-000000000001';
+
+    SELECT COUNT(*) INTO v_rows
+    FROM claim_order_outbox(
+        '74000000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001',
+        1
+    );
+    IF v_rows <> 0 THEN
+        RAISE EXCEPTION 'dispatch-started outbox item was blindly reclaimed';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows
+    FROM claim_order_outbox_recovery(
+        '74000000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001',
+        1
+    );
+    IF v_rows <> 1 THEN
+        RAISE EXCEPTION 'lookup-only recovery could not claim ambiguous dispatch';
+    END IF;
+END;
+$$;
+
+INSERT INTO broker_orders (
+    broker_order_id, intent_id, client_order_id, environment,
+    account_fingerprint, first_seen_at, raw_hash
+) VALUES (
+    'broker-confirmed-test',
+    '73000000-0000-0000-0000-000000000001',
+    'test-73000000000000000000000000000001',
+    'paper',
+    'lease-test',
+    clock_timestamp(),
+    repeat('e', 64)
+);
+
+INSERT INTO broker_order_events (
+    broker_event_id, broker_order_id, client_order_id, provider_status,
+    recognized_status, cumulative_filled_quantity, average_fill_price,
+    provider_occurred_at, received_at, x_request_id, raw_payload, raw_hash
+) VALUES (
+    '74500000-0000-0000-0000-000000000001',
+    'broker-confirmed-test',
+    'test-73000000000000000000000000000001',
+    'accepted',
+    TRUE,
+    0,
+    NULL,
+    clock_timestamp(),
+    clock_timestamp(),
+    'request-test-1',
+    '{"status":"accepted"}',
+    repeat('f', 64)
+);
+
+INSERT INTO intent_state_events (
+    intent_state_event_id, intent_id, state, reason_code,
+    detail, fencing_token, occurred_at
+) VALUES (
+    '73500000-0000-0000-0000-000000000003',
+    '73000000-0000-0000-0000-000000000001',
+    'broker_confirmed',
+    'TEST_BROKER_CONFIRMED',
+    '{}',
+    1,
+    clock_timestamp()
+);
+
+DO $$
+DECLARE
+    v_finalized BOOLEAN;
+BEGIN
+    v_finalized := finalize_order_outbox(
+        '74000000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001',
+        1,
+        'BROKER_CONFIRMED'
+    );
+    IF NOT v_finalized THEN
+        RAISE EXCEPTION 'current fenced executor could not finalize confirmed outbox item';
+    END IF;
+
+    v_finalized := finalize_order_outbox(
+        '74000000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001',
+        1,
+        'DUPLICATE_FINALIZE'
+    );
+    IF v_finalized THEN
+        RAISE EXCEPTION 'completed outbox item finalized twice';
+    END IF;
+END;
+$$;
+
+UPDATE executor_leases
+SET renewed_at = clock_timestamp() - INTERVAL '2 seconds',
+    lease_until = clock_timestamp() - INTERVAL '1 second'
+WHERE environment = 'paper' AND account_fingerprint = 'lease-test';
+
+DO $$
+DECLARE
+    v_token BIGINT;
+    v_rows INTEGER;
+BEGIN
+    v_token := acquire_executor_lease(
+        'paper',
+        'lease-test',
+        '60000000-0000-0000-0000-000000000002',
+        INTERVAL '15 seconds'
+    );
+    IF v_token <> 2 THEN
+        RAISE EXCEPTION 'expected takeover fencing token 2, got %', v_token;
+    END IF;
+
+    INSERT INTO account_snapshots (
+        account_snapshot_id, environment, account_fingerprint, broker_timestamp,
+        received_at, account_status, recognized_status, cash, equity, buying_power,
+        trading_blocked, transfers_blocked, account_blocked, payload, payload_hash
+    ) VALUES (
+        '75500000-0000-0000-0000-000000000002',
+        'paper',
+        'lease-test',
+        clock_timestamp(),
+        clock_timestamp(),
+        'ACTIVE',
+        TRUE,
+        10000.00,
+        10000.00,
+        10000.00,
+        FALSE,
+        FALSE,
+        FALSE,
+        '{}',
+        repeat('c', 64)
+    );
+
+    INSERT INTO reconciliation_runs (
+        reconciliation_id, environment, account_fingerprint, trigger,
+        kill_event_id, fencing_token, started_at
+    ) VALUES (
+        '76000000-0000-0000-0000-000000000002',
+        'paper',
+        'lease-test',
+        'failover',
+        '50000000-0000-0000-0000-000000000004',
+        v_token,
+        clock_timestamp() - INTERVAL '10 milliseconds'
+    );
+
+    UPDATE reconciliation_runs
+    SET completed_at = clock_timestamp(),
+        outcome = 'clean',
+        resumable = TRUE,
+        account_snapshot_id = '75500000-0000-0000-0000-000000000002',
+        evidence_hash = repeat('c', 64)
+    WHERE reconciliation_id = '76000000-0000-0000-0000-000000000002';
+
+    SELECT COUNT(*) INTO v_rows
+    FROM claim_order_outbox(
+        '74000000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000002',
+        v_token
+    );
+    IF v_rows <> 0 THEN
+        RAISE EXCEPTION 'reconciled executor takeover blindly reclaimed prior dispatch';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows
+    FROM claim_order_outbox(
+        '74000000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000001',
+        1
+    );
+    IF v_rows <> 0 THEN
+        RAISE EXCEPTION 'stale executor reclaimed outbox item';
+    END IF;
+
+    SELECT COUNT(*) INTO v_rows
+    FROM claim_order_outbox_recovery(
+        '74000000-0000-0000-0000-000000000001',
+        '60000000-0000-0000-0000-000000000002',
+        v_token
+    );
+    IF v_rows <> 0 THEN
+        RAISE EXCEPTION 'completed outbox item was reclaimed for recovery';
+    END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+    BEGIN
+        UPDATE order_outbox
+        SET payload = '{"tampered":true}'
+        WHERE outbox_id = '74000000-0000-0000-0000-000000000001';
+        RAISE EXCEPTION 'durable outbox payload was rewritten';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM = 'durable outbox payload was rewritten' THEN
+                RAISE;
+            END IF;
+    END;
+END;
+$$;
+
+INSERT INTO activation_permit_revocations (
+    revocation_id, permit_id, revoked_at, operator_subject,
+    reason_code, approval_digest
+) VALUES (
+    '75000000-0000-0000-0000-000000000001',
+    '40000000-0000-0000-0000-000000000001',
+    '2026-07-18T20:05:00Z',
+    'operator-test',
+    'TEST_REVOCATION',
+    repeat('7', 64)
+);
+
+INSERT INTO kill_events (
+    kill_event_id, environment, account_fingerprint, severity,
+    reason_code, detail, actor, operator_approved, approval_digest, occurred_at
+) VALUES (
+    '50000000-0000-0000-0000-000000000003',
+    'paper',
+    'acct-test',
+    'clear',
+    'TEST_OPERATOR_CLEAR',
+    '{}',
+    'operator-test',
+    TRUE,
+    repeat('8', 64),
+    '2026-07-18T20:06:00Z'
+);
+
+DO $$
+BEGIN
+    IF has_table_privilege('alpaca_trader_runtime', 'strategy_releases', 'INSERT') THEN
+        RAISE EXCEPTION 'runtime role can promote a strategy release';
+    END IF;
+    IF has_table_privilege('alpaca_trader_runtime', 'kill_events', 'INSERT') THEN
+        RAISE EXCEPTION 'runtime role can directly clear kill state';
+    END IF;
+    IF has_table_privilege('alpaca_trader_runtime', 'order_intents', 'UPDATE') THEN
+        RAISE EXCEPTION 'runtime role can rewrite an order intent';
+    END IF;
+    IF has_column_privilege(
+        'alpaca_trader_runtime', 'intent_state_events', 'event_sequence', 'INSERT'
+    ) OR has_column_privilege(
+        'alpaca_trader_runtime', 'broker_order_events', 'event_sequence', 'INSERT'
+    ) THEN
+        RAISE EXCEPTION 'runtime role can forge server-ordered event sequence';
+    END IF;
+    IF has_column_privilege(
+        'alpaca_trader_operator', 'experiment_events', 'event_sequence', 'INSERT'
+    ) THEN
+        RAISE EXCEPTION 'operator role can forge experiment event sequence';
+    END IF;
+    IF NOT has_function_privilege(
+        'alpaca_trader_runtime',
+        'record_runtime_kill_event(uuid,text,text,text,text,jsonb,text,timestamp with time zone)',
+        'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION 'runtime role cannot record an automated halt';
+    END IF;
+    IF NOT has_function_privilege(
+        'alpaca_trader_runtime',
+        'claim_order_outbox_recovery(uuid,uuid,bigint)',
+        'EXECUTE'
+    ) THEN
+        RAISE EXCEPTION 'runtime role lacks lookup-only recovery capability';
+    END IF;
+END;
+$$;
+
+SET ROLE alpaca_trader_runtime;
+
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO reconciliation_runs (
+            reconciliation_id, authority_sequence, environment,
+            account_fingerprint, trigger, kill_event_id, fencing_token, started_at
+        ) OVERRIDING SYSTEM VALUE VALUES (
+            '76000000-0000-0000-0000-000000000099',
+            9223372036854775807,
+            'paper',
+            'lease-test',
+            'manual',
+            '50000000-0000-0000-0000-000000000004',
+            2,
+            clock_timestamp()
+        );
+        RAISE EXCEPTION 'runtime forged reconciliation authority ordering';
+    EXCEPTION
+        WHEN insufficient_privilege THEN NULL;
+    END;
+END;
+$$;
+
+DO $$
+DECLARE
+    v_recorded BOOLEAN;
+BEGIN
+    v_recorded := record_runtime_kill_event(
+        '77000000-0000-0000-0000-000000000001',
+        'paper',
+        'lease-test',
+        'soft',
+        'TEST_RUNTIME_HALT',
+        '{"test":true}',
+        'runtime-test',
+        clock_timestamp()
+    );
+    IF NOT v_recorded THEN
+        RAISE EXCEPTION 'runtime role could not record an automated halt';
+    END IF;
+
+    v_recorded := record_runtime_kill_event(
+        '77000000-0000-0000-0000-000000000002',
+        'paper',
+        'lease-test',
+        'clear',
+        'ILLEGAL_RUNTIME_CLEAR',
+        '{}',
+        'runtime-test',
+        clock_timestamp()
+    );
+    IF v_recorded THEN
+        RAISE EXCEPTION 'runtime role cleared kill state through its function';
+    END IF;
+END;
+$$;
+
+RESET ROLE;
+
+SET ROLE alpaca_trader_operator;
+
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO kill_events (
+            kill_event_id, authority_sequence, environment, account_fingerprint,
+            severity, reason_code, detail, actor, operator_approved,
+            approval_digest, occurred_at
+        ) OVERRIDING SYSTEM VALUE VALUES (
+            '77000000-0000-0000-0000-000000000099',
+            9223372036854775807,
+            'paper',
+            'lease-test',
+            'clear',
+            'FORGED_ORDERING',
+            '{}',
+            'operator-test',
+            TRUE,
+            repeat('e', 64),
+            clock_timestamp()
+        );
+        RAISE EXCEPTION 'operator forged kill authority ordering';
+    EXCEPTION
+        WHEN insufficient_privilege THEN NULL;
+    END;
+END;
+$$;
+
+RESET ROLE;
+
+DO $$
+BEGIN
+    BEGIN
+        INSERT INTO kill_events (
+            kill_event_id, environment, account_fingerprint, severity,
+            reason_code, detail, actor, occurred_at
+        ) VALUES (
+            '50000000-0000-0000-0000-000000000002',
+            'paper',
+            'acct-test',
+            'clear',
+            'ILLEGAL_AUTOMATIC_CLEAR',
+            '{}',
+            'test-suite',
+            '2026-07-18T00:01:00Z'
+        );
+        RAISE EXCEPTION 'hard halt was cleared without operator approval';
+    EXCEPTION
+        WHEN check_violation THEN NULL;
+    END;
+END;
+$$;
+
+DO $$
+BEGIN
+    BEGIN
+        UPDATE kill_events
+        SET reason_code = 'ILLEGAL_REWRITE'
+        WHERE kill_event_id = '50000000-0000-0000-0000-000000000001';
+        RAISE EXCEPTION 'append-only trigger allowed mutation';
+    EXCEPTION
+        WHEN raise_exception THEN
+            IF SQLERRM = 'append-only trigger allowed mutation' THEN
+                RAISE;
+            END IF;
+    END;
+END;
+$$;

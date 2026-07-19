@@ -1,0 +1,6 @@
+bucket         = "REPLACE-paper-terraform-state"
+key            = "alpaca-autotrader/paper/terraform.tfstate"
+region         = "us-east-1"
+encrypt        = true
+dynamodb_table = "REPLACE-paper-terraform-locks"
+kms_key_id     = "REPLACE-paper-state-kms-key-arn"
