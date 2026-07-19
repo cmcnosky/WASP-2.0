@@ -62,7 +62,7 @@ impl<B: BrokerPort> Executor<B> {
                     .into(),
             ));
         }
-        if now < intent.quote_observed_at || now >= intent.quote_valid_until {
+        if now < intent.quote_received_at || now >= intent.quote_valid_until {
             return Err(ExecutionError::AuthorityDenied(
                 "fresh execution quote expired or is not yet observable".into(),
             ));
@@ -349,12 +349,16 @@ mod tests {
             side: OrderSide::Buy,
             quantity: WholeQuantity::new(1),
             limit_price: "10".parse::<Price>().unwrap(),
-            quote_observed_at: now - chrono::Duration::seconds(1),
-            quote_valid_until: now + chrono::Duration::minutes(1),
-            quote_source_hash: HashDigest::sha256("quote"),
+            decision_at: now - chrono::Duration::seconds(2),
+            arrival_quote: "10".parse::<Price>().unwrap(),
+            quote_provider_at: now - chrono::Duration::seconds(1),
+            quote_received_at: now - chrono::Duration::seconds(1),
+            quote_valid_until: now + chrono::Duration::seconds(10),
+            quote_payload_hash: HashDigest::sha256("quote"),
             time_in_force: TimeInForce::Day,
             decision_evidence_hash: HashDigest::sha256("decision"),
-            created_at: now,
+            materialization_evidence_hash: HashDigest::sha256("materialization"),
+            created_at: now - chrono::Duration::seconds(1),
         }
     }
 
