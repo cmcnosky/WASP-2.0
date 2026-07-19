@@ -1,0 +1,89 @@
+# Third-party dependency and license policy
+
+## Admission criteria
+
+Every direct application, build, test, infrastructure, and CI dependency must
+have a narrowly stated purpose, an official source, active maintenance, a
+license compatible with private commercial use, a pinned/locked version, and a
+review of meaningful transitive and supply-chain risk. Prefer standard-library
+capabilities and mature narrowly scoped packages over broad frameworks.
+
+Disallowed without a recorded exception:
+
+- copyleft network-service licenses or terms that could require disclosure;
+- abandoned, unmaintained, unverifiable, or source-unavailable packages;
+- dependencies fetched from local paths, personal forks, arbitrary URLs, or
+  moving branches;
+- packages that send telemetry or data externally by default;
+- a second broker client or a second implementation of strategy/risk decisions.
+
+Public crates and Python packages must be locked. Terraform providers must use
+version constraints and the generated lockfile. OCI base images and deployed
+application images must be pinned by digest for release. GitHub Actions must be
+pinned and updated deliberately. CI produces an SBOM and checks known
+vulnerabilities before promotion.
+
+## Review record
+
+For each new direct dependency, append:
+
+| Field | Required value |
+|---|---|
+| Name/version/ecosystem | Exact direct dependency |
+| Purpose | Capability that cannot reasonably remain internal |
+| Official source | Registry/project URL |
+| License | SPDX identifier and compatibility conclusion |
+| Maintenance | Latest release/activity and ownership assessment |
+| Security/data access | Network, filesystem, secret, unsafe-code, or telemetry surface |
+| Alternatives | Why this dependency is preferred |
+| Reviewer/date | Human or accountable agent and UTC date |
+
+Vulnerability exceptions must also record affected version, advisory, exposure,
+compensating controls, owner, and an expiry no longer than 30 days.
+
+## Initial direct-dependency review — 2026-07-18
+
+This baseline was selected for this clean-room repository. Versions are exact in
+manifests/lockfiles. “Declared license” is the upstream package declaration, not
+legal advice; the release gate below requires the generated transitive SBOM and
+license inventory to agree before any external deployment.
+
+| Dependency | Purpose | Official source | Declared license | Initial assessment |
+|---|---|---|---|---|
+| `anyhow 1.0.104` | Application error context | crates.io | MIT OR Apache-2.0 | Narrow app-boundary use; admitted |
+| `async-trait 0.1.81` | Testable async adapter traits | crates.io | MIT OR Apache-2.0 | Macro/build surface; admitted |
+| `chrono 0.4.38` | UTC domain timestamps | crates.io | MIT OR Apache-2.0 | No local-session calendar authority; admitted |
+| `clap 4.5.16` | Operator/local CLI parsing | crates.io | MIT OR Apache-2.0 | No secret values in arguments; admitted |
+| `hex 0.4.3` | Stable digest encoding | crates.io | MIT OR Apache-2.0 | Pure conversion; admitted |
+| `pyo3 0.29.0` | Python binding to the Rust core | crates.io | MIT OR Apache-2.0 | Research-only boundary; admitted |
+| `serde 1.0.208` | Versioned contract serialization | crates.io | MIT OR Apache-2.0 | Untrusted input still requires validation; admitted |
+| `serde_json 1.0.125` | Canonical JSON I/O/evidence | crates.io | MIT OR Apache-2.0 | Canonical hashing remains internal; admitted |
+| `sha2 0.10.8` | SHA-256 evidence hashes | crates.io | MIT OR Apache-2.0 | Not used as a signature/MAC; admitted |
+| `thiserror 1.0.63` | Typed library errors | crates.io | MIT OR Apache-2.0 | Proc macro; admitted |
+| `tokio 1.53.0` | Async execution tests/runtime foundation | crates.io | MIT | Bounded queues/timeouts still required; admitted |
+| `tracing 0.1.44` | Structured telemetry | crates.io | MIT | Redaction/allowlisting required; admitted |
+| `tracing-subscriber 0.3.23` | Controlled log formatting/filtering | crates.io | MIT | No dynamic remote filter; admitted |
+| `uuid 1.10.0` | Stable domain and intent identifiers | crates.io | MIT OR Apache-2.0 | Deterministic client-ID derivation remains internal; admitted |
+| `setuptools 83.0.0` | Build the dependency-free Python research package | PyPI | MIT | Exact build-only pin; admitted |
+| AWS/archive Terraform providers `5.100.0`/`2.8.0` | Managed AWS IaC and dead-man package | HashiCorp Registry | MPL-2.0 | Locked checksums; admitted for private IaC |
+| Terraform CLI `1.8.5` | Format and validate IaC | HashiCorp releases | BUSL-1.1 | Tool-only private use; operator must re-review terms before material reuse |
+| Rust 1.88, Python 3.12, PostgreSQL 17, Distroless Debian 12 images | Build, checks, database, runtime | Official OCI publishers | Mixed; image SBOM controls | Digest-pinned; release scan/license inventory required |
+| Pinned GitHub Actions and CI audit/lint tools | Checkout, tool setup, SBOM, scan, tests | Official project repositories/registries | Primarily MIT/Apache-2.0 | Commit-pinned actions; build-only; Dependabot monitored |
+
+The Python research package has no runtime PyPI dependency. AWS services and
+Alpaca are external services governed by their account agreements rather than
+software dependencies; their terms/entitlements are separate operator gates.
+
+The Rust 1.88 floor admits the PyO3 release that resolves the current RustSec
+advisories while remaining an exact, reproducible toolchain. Dependabot
+proposals repeat maintenance, license, MSRV, API, and safety review.
+
+### Release license gate
+
+**HOLD — do not deploy externally or activate paper/live execution** until CI
+generates the exact image and dependency SBOMs, every transitive component has a
+recognized license compatible with private use, vulnerability checks pass, and
+an operator/reviewer records acceptance for the immutable image digest. Unknown,
+missing, changed, copyleft-network, source-unavailable, or unexpectedly
+telemetric components block promotion. This gate is intentionally stricter than
+allowing local foundation builds.

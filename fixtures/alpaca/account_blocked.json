@@ -1,0 +1,17 @@
+{
+  "id": "00000000-0000-0000-0000-000000000002",
+  "account_number": "PA0000000001",
+  "status": "ACCOUNT_UPDATED",
+  "currency": "USD",
+  "cash": "10000.00",
+  "portfolio_value": "10000.00",
+  "equity": "10000.00",
+  "buying_power": "0.00",
+  "trading_blocked": true,
+  "transfers_blocked": false,
+  "account_blocked": false,
+  "trade_suspended_by_user": false,
+  "shorting_enabled": false,
+  "multiplier": "1",
+  "created_at": "2026-07-18T12:00:00Z"
+}

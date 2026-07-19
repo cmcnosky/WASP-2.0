@@ -1,0 +1,16 @@
+[package]
+name = "alpaca-autotrader-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "alpaca_autotrader_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3.workspace = true
+serde_json.workspace = true
+trader-core = { path = "../trader-core" }

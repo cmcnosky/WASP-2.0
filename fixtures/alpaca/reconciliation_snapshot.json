@@ -1,0 +1,63 @@
+{
+  "account": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "status": "ACTIVE",
+    "cash": "9899.84",
+    "equity": "10000.00",
+    "buying_power": "9899.84",
+    "trading_blocked": false,
+    "transfers_blocked": false,
+    "account_blocked": false
+  },
+  "positions": [
+    {
+      "asset_id": "20000000-0000-0000-0000-000000000001",
+      "symbol": "TEST",
+      "asset_class": "us_equity",
+      "qty": "10",
+      "side": "long",
+      "avg_entry_price": "10.016",
+      "market_value": "100.16",
+      "cost_basis": "100.16"
+    }
+  ],
+  "open_orders": [],
+  "recent_orders": [
+    {
+      "id": "10000000-0000-0000-0000-000000000001",
+      "client_order_id": "v1-paper-release-decision-001",
+      "symbol": "TEST",
+      "qty": "10",
+      "filled_qty": "10",
+      "filled_avg_price": "10.016",
+      "side": "buy",
+      "order_type": "limit",
+      "time_in_force": "day",
+      "status": "filled",
+      "submitted_at": "2026-07-18T14:00:00Z",
+      "filled_at": "2026-07-18T14:00:03Z"
+    }
+  ],
+  "activities": [
+    {
+      "id": "fill-001",
+      "activity_type": "FILL",
+      "transaction_time": "2026-07-18T14:00:02Z",
+      "order_id": "10000000-0000-0000-0000-000000000001",
+      "symbol": "TEST",
+      "side": "buy",
+      "qty": "4",
+      "price": "10.01"
+    },
+    {
+      "id": "fill-002",
+      "activity_type": "FILL",
+      "transaction_time": "2026-07-18T14:00:03Z",
+      "order_id": "10000000-0000-0000-0000-000000000001",
+      "symbol": "TEST",
+      "side": "buy",
+      "qty": "6",
+      "price": "10.02"
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+environment             = "live"
+expected_aws_account_id = "222222222222"
+aws_region              = "us-east-1"
+
+vpc_cidr                   = "10.84.0.0/16"
+public_subnet_cidrs         = ["10.84.0.0/24", "10.84.1.0/24"]
+private_app_subnet_cidrs    = ["10.84.10.0/24", "10.84.11.0/24"]
+private_db_subnet_cidrs     = ["10.84.20.0/24", "10.84.21.0/24"]
+
+github_repository         = "OWNER/REPOSITORY"
+container_image_digest    = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+execution_mode            = "read_only"
+deploy_application        = false
+alert_email               = "operator@example.invalid"
+create_account_budget     = true
+monthly_budget_usd        = 1000
+
+# Keep live_activation_approval_id null until every live gate passes. No broker,
+# cloud, database, signing, or personal credential belongs in this file.

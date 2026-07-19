@@ -1,0 +1,51 @@
+# Rust
+/target/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+*.cdx.json
+
+# Local databases and research data
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.parquet
+*.arrow
+*.feather
+data/
+research-output/
+
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+infra/terraform/deadman.zip
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
