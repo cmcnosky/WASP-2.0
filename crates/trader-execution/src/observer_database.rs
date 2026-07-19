@@ -206,36 +206,74 @@ impl PaperObserverDatabaseConfig {
         };
 
         Ok(VerifiedPaperObserverDatabase {
-            store,
-            connection_task,
+            store: Some(store),
+            connection_task: Some(connection_task),
         })
     }
 }
 
 /// Verified connection owner that reveals only the coordinator store port.
 pub struct VerifiedPaperObserverDatabase {
-    store: PgObserverStore,
-    connection_task: JoinHandle<Result<(), ObserverDatabaseError>>,
+    store: Option<PgObserverStore>,
+    connection_task: Option<JoinHandle<Result<(), ObserverDatabaseError>>>,
 }
 
 impl VerifiedPaperObserverDatabase {
     pub fn coordinator_store_mut(
         &mut self,
     ) -> Result<&mut dyn CoordinatorStore, ObserverDatabaseError> {
-        if self.connection_task.is_finished() {
+        if self
+            .connection_task
+            .as_ref()
+            .is_none_or(JoinHandle::is_finished)
+        {
             return Err(ObserverDatabaseError::ConnectionEnded);
         }
-        Ok(&mut self.store)
+        self.store
+            .as_mut()
+            .map(|store| store as &mut dyn CoordinatorStore)
+            .ok_or(ObserverDatabaseError::ConnectionEnded)
     }
 
     pub fn connection_is_alive(&self) -> bool {
-        !self.connection_task.is_finished()
+        self.connection_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+    }
+
+    /// Transfers the verified observer store and its monitored connection
+    /// driver to the long-running supervisor. Both parts must remain owned and
+    /// supervised together; neither is exposed outside this crate.
+    pub(crate) fn into_supervised_parts(
+        mut self,
+    ) -> Result<
+        (
+            PgObserverStore,
+            JoinHandle<Result<(), ObserverDatabaseError>>,
+        ),
+        ObserverDatabaseError,
+    > {
+        let store = self
+            .store
+            .take()
+            .ok_or(ObserverDatabaseError::ConnectionEnded)?;
+        let connection_task = self
+            .connection_task
+            .take()
+            .ok_or(ObserverDatabaseError::ConnectionEnded)?;
+        if connection_task.is_finished() {
+            connection_task.abort();
+            return Err(ObserverDatabaseError::ConnectionEnded);
+        }
+        Ok((store, connection_task))
     }
 }
 
 impl Drop for VerifiedPaperObserverDatabase {
     fn drop(&mut self) {
-        self.connection_task.abort();
+        if let Some(connection_task) = self.connection_task.as_ref() {
+            connection_task.abort();
+        }
     }
 }
 

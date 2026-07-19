@@ -708,7 +708,7 @@ impl CoordinatorStore for PgObserverStore {
                     &cycle.owner_id(),
                     &token,
                     &cycle.cycle_id(),
-                    &"startup",
+                    &cycle.trigger().as_str(),
                     &cycle.started_at(),
                     &cycle.key().evidence_hash.as_hex(),
                 ],
