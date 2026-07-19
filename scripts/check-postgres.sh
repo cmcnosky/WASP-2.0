@@ -29,8 +29,14 @@ docker run --detach \
 
 ready=0
 for _attempt in $(seq 1 60); do
-  if docker exec "$container_name" pg_isready \
-    --username "$database_user" --dbname "$database_name" >/dev/null 2>&1; then
+  # The official image starts a temporary postmaster while initializing and then
+  # replaces PID 1 with the final postmaster. pg_isready alone can observe the
+  # temporary server, so require both final PID identities before proceeding.
+  if docker exec "$container_name" sh -ceu \
+    'test "$(cat /proc/1/comm)" = postgres
+     test "$(head -n 1 "$PGDATA/postmaster.pid")" = 1' >/dev/null 2>&1 \
+    && docker exec "$container_name" pg_isready \
+      --username "$database_user" --dbname "$database_name" >/dev/null 2>&1; then
     ready=1
     break
   fi
