@@ -61,24 +61,35 @@ The connector consumes only the observer-prefixed database inputs:
 `OBSERVER_DATABASE_NAME`, `OBSERVER_DATABASE_USER`,
 `OBSERVER_DATABASE_PASSWORD`, `OBSERVER_DATABASE_REQUIRE_TLS`, and
 `OBSERVER_RDS_CA_BUNDLE_PEM`, plus independently reviewed host and CA digests.
-Map these from a paper-observer-specific Secrets Manager secret at deployment;
-never reuse the executor runtime secret. The current Terraform and application
-entrypoint do not yet perform that wiring, so this section is a bootstrap
-contract and does not authorize starting ECS.
+Terraform maps `OBSERVER_DATABASE_USER`, `OBSERVER_DATABASE_PASSWORD`, and
+`OBSERVER_RDS_CA_BUNDLE_PEM` from the paper-only
+`paper-observer-database` secret; it never reuses the executor runtime secret.
+The stopped task definition also maps the fingerprint salt from the separate
+`paper-observer-identity` secret. This offline wiring is a bootstrap contract,
+not authority to start ECS; the deployment-evidence precondition remains closed.
 
 ## Secret population
 
-After tests pass, generate a strong unique runtime password without placing it
-in shell history, arguments, Terraform, Git, logs, or chat. Write JSON keys
-`username`, `password`, and `ca_bundle_pem` directly to the environment's
-`runtime-database` Secrets Manager secret. `ca_bundle_pem` must be the current
-AWS-published root certificate for the exact RDS region, downloaded over a
-separately verified administrative path; do not include a private key or a
-non-AWS trust bundle. Record its SHA-256 digest in the deployment evidence and
-set the same digest through the independently reviewed Terraform variable
-`expected_rds_ca_bundle_sha256`; the runtime fails closed if the secret value
-does not match. Confirm the database instance reports the approved
-`rds_ca_cert_identifier` before starting the task.
+After tests pass, generate strong unique runtime and observer passwords without
+placing either in shell history, arguments, Terraform, Git, logs, or chat.
+Write JSON keys `username`, `password`, and `ca_bundle_pem` directly to the
+environment's `runtime-database` and, for paper only,
+`paper-observer-database` Secrets Manager secrets. The credentials must be
+different and bound to only their corresponding database role.
+`ca_bundle_pem` must be the current AWS-published root certificate for the exact
+RDS region, downloaded over a separately verified administrative path; do not
+include a private key or a non-AWS trust bundle. Record its SHA-256 digest in
+the deployment evidence and set the same digest through the independently
+reviewed Terraform variable `expected_rds_ca_bundle_sha256`; each connector
+fails closed if the secret value does not match. Confirm the database instance
+reports the approved `rds_ca_cert_identifier` before starting any task.
+
+For paper only, populate `paper-observer-identity` with the single JSON key
+`account_fingerprint_salt_hex`. It must decode to 32–1024 random bytes, remain
+stable across Alpaca API-key rotation, and never appear in Terraform, logs,
+commands, Git, or chat. Do not populate or start the observer until the separate
+safe account-fingerprint bootstrap command exists and its non-secret result is
+independently reviewed.
 Restart into reconcile-only and verify hostname-validated TLS, the pinned bundle
 digest, schema version, runtime permission self-check, and broker/local
 reconciliation.

@@ -41,6 +41,16 @@ output "runtime_database_secret_arn" {
   value       = aws_secretsmanager_secret.runtime_database.arn
 }
 
+output "paper_observer_database_secret_arn" {
+  description = "Paper only; populate with the dedicated observer login and approved CA bundle."
+  value       = local.is_live ? null : aws_secretsmanager_secret.paper_observer_database[0].arn
+}
+
+output "paper_observer_identity_secret_arn" {
+  description = "Paper only; populate account_fingerprint_salt_hex out of band and never place it in Terraform state."
+  value       = local.is_live ? null : aws_secretsmanager_secret.paper_observer_identity[0].arn
+}
+
 output "data_bucket" {
   value = aws_s3_bucket.data.id
 }

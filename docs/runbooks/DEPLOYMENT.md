@@ -3,9 +3,11 @@
 **Current status: HOLD — this runbook is not executable yet.** Terraform blocks
 application deployment, and the GitHub OIDC role explicitly denies ECS
 deployment and `iam:PassRole`. The long-running read-only observer now exists,
-but its ECS command, dedicated secrets/IAM inputs, runtime health check, image
-attestation, and real RDS/container failure evidence do not. The steps below
-describe the later approved flow; an approval ID alone cannot open the hold.
+and its stopped ECS definition now has offline-verified command,
+observer-specific secret inputs, and a no-permission task role. Runtime-aware
+health, independent image attestation, safe account-fingerprint bootstrap, and
+real RDS/container failure evidence do not exist. The steps below describe the
+later approved flow; an approval ID alone cannot open the hold.
 
 ## Preconditions
 

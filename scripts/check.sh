@@ -43,6 +43,12 @@ fi
 
 ./scripts/check-pyo3.sh
 
+if command -v docker >/dev/null 2>&1; then
+  ./scripts/check-container-contract.sh
+else
+  printf 'Container contract check skipped: docker is not installed\n'
+fi
+
 ./scripts/check-infra.sh
 
 if command -v docker >/dev/null 2>&1; then

@@ -41,6 +41,8 @@ resource "aws_iam_role_policy_attachment" "ecs_execution" {
 }
 
 data "aws_iam_policy_document" "ecs_execution_secrets" {
+  count = local.is_live ? 0 : 1
+
   statement {
     sid    = "ReadEnvironmentSecrets"
     effect = "Allow"
@@ -50,7 +52,8 @@ data "aws_iam_policy_document" "ecs_execution_secrets" {
     ]
     resources = [
       aws_secretsmanager_secret.alpaca.arn,
-      aws_secretsmanager_secret.runtime_database.arn
+      aws_secretsmanager_secret.paper_observer_database[0].arn,
+      aws_secretsmanager_secret.paper_observer_identity[0].arn
     ]
   }
 
@@ -63,84 +66,102 @@ data "aws_iam_policy_document" "ecs_execution_secrets" {
 }
 
 resource "aws_iam_role_policy" "ecs_execution_secrets" {
+  count = local.is_live ? 0 : 1
+
   name   = "environment-secrets"
   role   = aws_iam_role.ecs_execution.id
-  policy = data.aws_iam_policy_document.ecs_execution_secrets.json
+  policy = data.aws_iam_policy_document.ecs_execution_secrets[0].json
 }
 
 resource "aws_iam_role" "app" {
-  name               = "${local.name_prefix}-task"
+  name               = "${local.name_prefix}-paper-observer-task"
   assume_role_policy = data.aws_iam_policy_document.ecs_task_assume.json
-  tags               = local.common_tags
+  tags = merge(local.common_tags, {
+    Runtime = "get-only-paper-observer"
+  })
 }
 
-data "aws_iam_policy_document" "app" {
-  statement {
-    sid    = "ReadWriteVersionedData"
-    effect = "Allow"
-    actions = [
-      "s3:GetObject",
-      "s3:GetObjectAttributes",
-      "s3:GetObjectVersion",
-      "s3:PutObject"
-    ]
-    resources = ["${aws_s3_bucket.data.arn}/*"]
-  }
+locals {
+  paper_observer_environment = [
+    { name = "APP_ENVIRONMENT", value = var.environment },
+    { name = "EXECUTION_MODE", value = var.execution_mode },
+    { name = "EXPECTED_ALPACA_ACCOUNT_FINGERPRINT", value = var.expected_alpaca_account_fingerprint == null ? "" : var.expected_alpaca_account_fingerprint },
+    { name = "EXPECTED_IMAGE_DIGEST", value = var.container_image_digest },
+    { name = "OBSERVER_DATABASE_HOST", value = aws_db_instance.main.address },
+    { name = "EXPECTED_OBSERVER_DATABASE_HOST_SHA256", value = var.expected_observer_database_host_sha256 == null ? "" : var.expected_observer_database_host_sha256 },
+    { name = "OBSERVER_DATABASE_PORT", value = tostring(aws_db_instance.main.port) },
+    { name = "OBSERVER_DATABASE_NAME", value = var.database_name },
+    { name = "OBSERVER_DATABASE_REQUIRE_TLS", value = "true" },
+    { name = "EXPECTED_OBSERVER_RDS_CA_BUNDLE_SHA256", value = var.expected_rds_ca_bundle_sha256 },
+    { name = "METRIC_NAMESPACE", value = local.metric_namespace },
+    { name = "AWS_REGION", value = var.aws_region },
+    { name = "RUST_LOG", value = "info" }
+  ]
 
-  statement {
-    sid    = "WriteAuditExports"
-    effect = "Allow"
-    actions = [
-      "s3:GetObject",
-      "s3:GetObjectVersion",
-      "s3:PutObject"
-    ]
-    resources = ["${aws_s3_bucket.audit.arn}/*"]
-  }
+  paper_observer_secrets = local.is_live ? [] : [
+    {
+      name      = "OBSERVER_DATABASE_USER"
+      valueFrom = "${aws_secretsmanager_secret.paper_observer_database[0].arn}:username::"
+    },
+    {
+      name      = "OBSERVER_DATABASE_PASSWORD"
+      valueFrom = "${aws_secretsmanager_secret.paper_observer_database[0].arn}:password::"
+    },
+    {
+      name      = "OBSERVER_RDS_CA_BUNDLE_PEM"
+      valueFrom = "${aws_secretsmanager_secret.paper_observer_database[0].arn}:ca_bundle_pem::"
+    },
+    {
+      name      = "ALPACA_ACCOUNT_FINGERPRINT_SALT_HEX"
+      valueFrom = "${aws_secretsmanager_secret.paper_observer_identity[0].arn}:account_fingerprint_salt_hex::"
+    },
+    {
+      name      = "ALPACA_API_KEY_ID"
+      valueFrom = "${aws_secretsmanager_secret.alpaca.arn}:api_key_id::"
+    },
+    {
+      name      = "ALPACA_API_SECRET_KEY"
+      valueFrom = "${aws_secretsmanager_secret.alpaca.arn}:api_secret_key::"
+    }
+  ]
 
-  statement {
-    sid    = "ListEnvironmentBuckets"
-    effect = "Allow"
-    actions = [
-      "s3:GetBucketLocation",
-      "s3:ListBucket",
-      "s3:ListBucketVersions"
-    ]
-    resources = [
-      aws_s3_bucket.data.arn,
-      aws_s3_bucket.audit.arn
-    ]
-  }
+  paper_observer_container = {
+    name      = "app"
+    image     = "${aws_ecr_repository.app.repository_url}@${var.container_image_digest}"
+    command   = ["paper-observer"]
+    essential = true
+    user      = "65532"
 
-  statement {
-    sid    = "EnvironmentEncryption"
-    effect = "Allow"
-    actions = [
-      "kms:Decrypt",
-      "kms:DescribeKey",
-      "kms:GenerateDataKey"
-    ]
-    resources = [aws_kms_key.main.arn]
-  }
+    readonlyRootFilesystem = true
+    stopTimeout            = 120
 
-  statement {
-    sid       = "PublishApplicationMetrics"
-    effect    = "Allow"
-    actions   = ["cloudwatch:PutMetricData"]
-    resources = ["*"]
+    linuxParameters = {
+      initProcessEnabled = true
+      capabilities = {
+        drop = ["ALL"]
+      }
+    }
 
-    condition {
-      test     = "StringEquals"
-      variable = "cloudwatch:namespace"
-      values   = [local.metric_namespace]
+    environment = local.paper_observer_environment
+    secrets     = local.paper_observer_secrets
+
+    healthCheck = {
+      command     = ["CMD", "/app/alpaca-autotrader", "health", "--local"]
+      interval    = 30
+      timeout     = 5
+      retries     = 3
+      startPeriod = 20
+    }
+
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = aws_cloudwatch_log_group.app.name
+        awslogs-region        = var.aws_region
+        awslogs-stream-prefix = "app"
+      }
     }
   }
-}
-
-resource "aws_iam_role_policy" "app" {
-  name   = "runtime-minimum"
-  role   = aws_iam_role.app.id
-  policy = data.aws_iam_policy_document.app.json
 }
 
 resource "aws_ecs_task_definition" "app" {
@@ -161,79 +182,7 @@ resource "aws_ecs_task_definition" "app" {
     size_in_gib = 21
   }
 
-  container_definitions = jsonencode([{
-    name      = "app"
-    image     = "${aws_ecr_repository.app.repository_url}@${var.container_image_digest}"
-    essential = true
-    user      = "65532"
-
-    readonlyRootFilesystem = true
-    stopTimeout            = 120
-
-    linuxParameters = {
-      initProcessEnabled = true
-      capabilities = {
-        drop = ["ALL"]
-      }
-    }
-
-    environment = [
-      { name = "APP_ENVIRONMENT", value = var.environment },
-      { name = "EXECUTION_MODE", value = var.execution_mode },
-      { name = "ACTIVATION_APPROVAL_ID", value = var.live_activation_approval_id == null ? "" : var.live_activation_approval_id },
-      { name = "DATABASE_HOST", value = aws_db_instance.main.address },
-      { name = "EXPECTED_DATABASE_HOST_SHA256", value = sha256(aws_db_instance.main.address) },
-      { name = "DATABASE_PORT", value = tostring(aws_db_instance.main.port) },
-      { name = "DATABASE_NAME", value = var.database_name },
-      { name = "DATABASE_REQUIRE_TLS", value = "true" },
-      { name = "EXPECTED_RDS_CA_BUNDLE_SHA256", value = var.expected_rds_ca_bundle_sha256 },
-      { name = "DATA_BUCKET", value = aws_s3_bucket.data.id },
-      { name = "AUDIT_BUCKET", value = aws_s3_bucket.audit.id },
-      { name = "METRIC_NAMESPACE", value = local.metric_namespace },
-      { name = "AWS_REGION", value = var.aws_region },
-      { name = "RUST_LOG", value = "info" }
-    ]
-
-    secrets = [
-      {
-        name      = "DATABASE_USER"
-        valueFrom = "${aws_secretsmanager_secret.runtime_database.arn}:username::"
-      },
-      {
-        name      = "DATABASE_PASSWORD"
-        valueFrom = "${aws_secretsmanager_secret.runtime_database.arn}:password::"
-      },
-      {
-        name      = "RDS_CA_BUNDLE_PEM"
-        valueFrom = "${aws_secretsmanager_secret.runtime_database.arn}:ca_bundle_pem::"
-      },
-      {
-        name      = "ALPACA_API_KEY_ID"
-        valueFrom = "${aws_secretsmanager_secret.alpaca.arn}:api_key_id::"
-      },
-      {
-        name      = "ALPACA_API_SECRET_KEY"
-        valueFrom = "${aws_secretsmanager_secret.alpaca.arn}:api_secret_key::"
-      }
-    ]
-
-    healthCheck = {
-      command     = ["CMD", "/app/alpaca-autotrader", "health", "--local"]
-      interval    = 30
-      timeout     = 5
-      retries     = 3
-      startPeriod = 20
-    }
-
-    logConfiguration = {
-      logDriver = "awslogs"
-      options = {
-        awslogs-group         = aws_cloudwatch_log_group.app.name
-        awslogs-region        = var.aws_region
-        awslogs-stream-prefix = "app"
-      }
-    }
-  }])
+  container_definitions = jsonencode([local.paper_observer_container])
 
   tags = merge(local.common_tags, {
     Name        = local.name_prefix
@@ -262,8 +211,18 @@ resource "aws_ecs_task_definition" "app" {
     }
 
     precondition {
-      condition     = local.deployment_has_observer_entrypoint
-      error_message = "deploy_application remains blocked until the image contains a tested long-running paper observer entrypoint."
+      condition     = local.deployment_has_observer_wiring
+      error_message = "deploy_application requires the reviewed GET-only paper-observer task wiring."
+    }
+
+    precondition {
+      condition     = local.deployment_has_observer_inputs
+      error_message = "deploy_application requires independently reviewed paper account and database-host fingerprints."
+    }
+
+    precondition {
+      condition     = local.deployment_has_observer_evidence
+      error_message = "deploy_application remains blocked pending runtime-aware health, image attestation, fingerprint bootstrap, and real observer evidence."
     }
 
     precondition {
@@ -274,6 +233,11 @@ resource "aws_ecs_task_definition" "app" {
     precondition {
       condition     = local.deployment_has_real_ca_digest
       error_message = "deploy_application requires the real approved RDS root bundle digest, not the example placeholder."
+    }
+
+    precondition {
+      condition     = local.deployment_has_real_image_digest
+      error_message = "deploy_application requires a real immutable image digest, not the example placeholder."
     }
 
     precondition {

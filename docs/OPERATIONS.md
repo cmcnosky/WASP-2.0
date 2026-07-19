@@ -24,6 +24,10 @@ realized/unrealized P&L, loss/drawdown gates, and task/database health.
 The infrastructure alarms on absent heartbeat, task stop, database pressure,
 and any positive safety-counter metric. Alerts identify environment, immutable
 image/release, category, first/last occurrence, and a non-secret correlation ID.
+The provider-free `health --local` command proves only that the image can launch
+the binary without secrets or network access. It is not observer liveness,
+database/lease readiness, cycle freshness, or reconciliation health; deployment
+stays blocked until those signals and a runtime-aware health boundary exist.
 
 ## Daily procedure
 

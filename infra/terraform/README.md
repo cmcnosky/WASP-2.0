@@ -10,12 +10,14 @@ Terraform success is not order authority. The default `execution_mode` is
 the application must validate the actual signed activation permit and broker
 account fingerprint.
 
-The current binary has a long-running GET-only `paper-observer` command, but the
-task definition does not yet select it or inject its dedicated database,
-fingerprint, salt, metric, and image-attestation inputs. Terraform therefore
-defaults `deploy_application=false`, keeping ECS desired count at zero. Do not
-set it true until that task wiring and its real RDS/container failure paths pass
-review and `runtime_ready_approval_id` identifies the evidence. Runtime alarms
+The stopped task definition now selects the long-running GET-only
+`paper-observer`, injects only its reviewed paper inputs, uses dedicated empty
+observer database/identity secrets, and assigns a task role with no AWS API
+permissions. Terraform still defaults `deploy_application=false`, keeping ECS
+desired count at zero, and an unconditional evidence precondition rejects every
+attempt to turn it on. Runtime-aware health, independent image attestation, a
+safe account-fingerprint bootstrap, and real RDS/container evidence are still
+absent; `runtime_ready_approval_id` cannot substitute for them. Runtime alarms
 are not created and the dead-man schedule stays disabled while the task is
 intentionally absent; there is no fake heartbeat process.
 
@@ -28,8 +30,10 @@ intentionally absent; there is no fake heartbeat process.
 - PostgreSQL 17 RDS: paper Single-AZ/7-day PITR; live Multi-AZ/35-day PITR,
   enhanced monitoring, deletion protection, and final snapshot.
 - KMS-encrypted/versioned/object-locked S3 data and audit buckets, immutable ECR,
-  and empty environment-specific Alpaca/runtime-database Secrets Manager
-  secrets. The task cannot read the RDS master secret.
+  and empty environment-specific Alpaca/runtime-database secrets. Paper also
+  creates separate empty observer-database and observer-identity secrets. The
+  stopped observer task can reference only the paper Alpaca and observer
+  secrets; it cannot read the runtime or RDS master secret.
 - CloudWatch/SNS safety alarms, ECS-stop event, and independent EventBridge/
   Lambda dead-man check with telemetry permissions only.
 - Environment-scoped GitHub OIDC image-publishing role with explicit ECS
@@ -72,19 +76,22 @@ split the approved rollout into two saved plans:
    runtime secrets with execution read-only.
 2. Build/test/scan the exact image, push it through the environment OIDC role,
    and record its registry digest (not a tag).
-3. Using an isolated migration-only process, create the non-owner runtime DB role
-   and exact grants described in `docs/runbooks/DATABASE_BOOTSTRAP.md`. Populate
-   its secret with JSON keys `username`, `password`, and `ca_bundle_pem`. The CA
+3. Using an isolated migration-only process, create the distinct non-owner
+   runtime and paper-observer DB roles and exact grants described in
+   `docs/runbooks/DATABASE_BOOTSTRAP.md`. Populate each dedicated database
+   secret with JSON keys `username`, `password`, and `ca_bundle_pem`. The CA
    value is the current AWS-published root certificate for the exact RDS region;
    record and approve its SHA-256 digest, set that digest separately in
    `expected_rds_ca_bundle_sha256`, and verify it matches the pinned
    `rds_ca_cert_identifier`. The RDS-managed master secret must never be granted
    to ECS.
 4. Populate the Alpaca secret directly with JSON keys `api_key_id` and
-   `api_secret_key`; do not print either secret.
-5. Keep `deploy_application=false` while the task lacks reviewed observer
-   command/secret/IAM wiring and real RDS/container evidence. After that review,
-   set its approval ID and plan the digest-pinned task/service; confirm no public
+   `api_secret_key`, and the separate paper observer identity secret with only
+   `account_fingerprint_salt_hex`; do not print any value.
+5. Keep `deploy_application=false`. Offline command/secret/IAM composition is
+   verified, but runtime-aware health, independent image/account evidence, and
+   real RDS/container failure paths are not. A later reviewed change may open
+   the evidence precondition only after those controls pass; confirm no public
    IP/inbound rule, desired count one, and read-only execution mode.
 
 If a staged first apply is operationally inconvenient, refactor foundation and
@@ -100,18 +107,20 @@ different GitHub environments and protection rules. If both stacks temporarily
 share an AWS account, pass the existing GitHub provider ARN to the second stack;
 every other named resource and state still remains distinct.
 
-The current Terraform revision cannot deploy an application task: the task
-precondition is closed and the GitHub OIDC role may publish images but is
-explicitly denied ECS deployment and `iam:PassRole`. A later reviewed code
-change must remove both holds only after the observer task composition is wired,
-tested against real paper/RDS boundaries, and operator-approved. Live would then start in read-only for at least five reconciled
+The current Terraform revision cannot deploy an application task: the external
+evidence precondition is closed and the GitHub OIDC role may publish images but
+is explicitly denied ECS deployment and `iam:PassRole`. A later reviewed code
+change must remove both holds only after runtime health/image/account controls
+and real paper/RDS evidence pass and are operator-approved. Live would then start in read-only for at least five reconciled
 trading sessions; mutation still requires the complete live-readiness runbook.
 
 ## Validation and drills
 
 `../../scripts/check-infra.sh` runs format, init-without-backend, validation, two
-valid stopped-environment plans, and thirteen negative mocked plans that prove
-the account, environment/execution, activation, runtime/entrypoint, CA digest,
+valid stopped-environment plans, and thirteen negative mocked plans. The tests
+also verify the exact observer command/input allowlists, dedicated paper secrets,
+no-policy task role, and zero live observer-secret injection while proving the
+account, environment/execution, activation, runtime/evidence, CA/image digest,
 Fargate, database-name, alert, and budget preconditions block unsafe plans. Before live
 authority, complete and record task-kill, deployment rollback, RDS failover,
 PITR restore, credential rotation, alert delivery, dead-man, and region
