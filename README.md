@@ -1,5 +1,10 @@
 # Alpaca Autonomous Trader
 
+> **Visitors:** every line of code here was written by AI coding agents directed by a
+> single non-engineer operator. [CASE_STUDY.md](CASE_STUDY.md) explains how, and the
+> 24-page technical handoff attached to this repository's releases gives the complete
+> guided tour. The status warning below is real and load-bearing.
+
 A private, single-user, clean-room trading system built as a Rust modular
 monolith. Python research calls the same compiled strategy, decision-replay,
 and risk core through PyO3; performance replay is currently limited to a
