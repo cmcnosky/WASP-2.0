@@ -16,7 +16,7 @@ rust-version = "1.88"
 
 [workspace.dependencies]
 anyhow = "=1.0.104"
-async-trait = "=0.1.81"
+async-trait = "=0.1.91"
 chrono = { version = "=0.4.38", features = ["serde"] }
 clap = { version = "=4.5.16", features = ["derive"] }
 hex = "=0.4.3"
