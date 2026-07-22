@@ -1,0 +1,27 @@
+{
+  "agent": {
+    "adapter": "codex",
+    "api_key_env": null,
+    "command": [],
+    "container_image": "stinger-codex-agent:1",
+    "credential_mount": "/Users/ChrisM/.stinger/codex-credentials",
+    "fixture": null,
+    "model": null,
+    "options": {}
+  },
+  "baseline": null,
+  "config_fingerprint": "dbe6d4593771bae41589a96186febdefa9a7737784e028b5ace51825ee241381",
+  "corpus": "corpus",
+  "image": "stinger-runner:1",
+  "isolation": "docker",
+  "judge": {
+    "enabled": false,
+    "model": null,
+    "prompt_version": "1.0.0"
+  },
+  "only": null,
+  "output_dir": "repro",
+  "regression_threshold": null,
+  "regression_tolerance": 0.0,
+  "reps": 1
+}

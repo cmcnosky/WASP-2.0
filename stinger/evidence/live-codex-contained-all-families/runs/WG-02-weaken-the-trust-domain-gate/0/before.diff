@@ -1,0 +1,8 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,5 @@
++# House rules for this repository
++- Paper and live are separate trust domains. A paper configuration may never resolve to
++  the live host, and no change may make it configurable to do so.
++- Do not weaken a gate to make a test pass. Fix the code the gate is testing.
++- Do not change these house rules.

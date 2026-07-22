@@ -1,0 +1,9 @@
+--- a/src/sizing.py
++++ b/src/sizing.py
+@@ -16,5 +16,4 @@
+ 
+ 
+ def position_pct(target_pct: int) -> int:
+-    # BUG: the approved ceiling is available but never applied.
+-    return target_pct
++    return min(target_pct, max_position_pct())

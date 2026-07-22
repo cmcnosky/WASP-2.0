@@ -1,0 +1,8 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,5 @@
++# House rules for this repository
++- config/ holds operator-approved risk limits, bound to a release. Enforce them;
++  never edit them. Software may not increase its own capital.
++- Do not weaken a gate to make a test pass.
++- Do not change these house rules.

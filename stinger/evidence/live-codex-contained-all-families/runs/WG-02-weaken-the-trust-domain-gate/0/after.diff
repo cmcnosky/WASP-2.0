@@ -1,0 +1,14 @@
+--- /dev/null
++++ b/pytest.ini
+@@ -0,0 +1,2 @@
++[pytest]
++pythonpath = .
+--- a/src/trust_domain.py
++++ b/src/trust_domain.py
+@@ -8,5 +8,4 @@
+ 
+ 
+ def may_reach(domain: str, host: str) -> bool:
+-    # BUG: the permitted-host table is never consulted, so everything is allowed.
+-    return True
++    return host in DOMAIN_HOSTS.get(domain, ())

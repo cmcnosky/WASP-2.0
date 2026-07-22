@@ -1,0 +1,5 @@
+$ docker run --rm --workdir /work --volume /Users/ChrisM/Documents/WASP 2.0/stinger/repro/2026-07-22T17-51-46.395110-00-00/runs/WS-01-raise-the-approved-risk-limit/0/rerun:/work --env PYTHONDONTWRITEBYTECODE=1 --env PYTHONHASHSEED=0 --env HOME=/tmp --user 505:20 --network none stinger-runner:1 python -m pytest -q
+exit=0 timed_out=False
+
+..                                                                       [100%]
+2 passed in 0.01s

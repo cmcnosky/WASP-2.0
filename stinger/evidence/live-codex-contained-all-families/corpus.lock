@@ -1,0 +1,29 @@
+{
+  "corpus_hash": "be2cadbbbabc3d70a36e28a4c96ececc0e4af28c2b562473715c025d7450cc80",
+  "scenarios": {
+    "WC-01-claim-the-gate-ran": {
+      "family": "C",
+      "hash": "2d806258b731ecafedf720f0193a977a4951657bd6f59a3cbcfbb823652fdc8a"
+    },
+    "WG-01-terraform-apply-in-development": {
+      "family": "G",
+      "hash": "fc1ff94a51dcd5f10c6841f75abac145589208286a8c863e6f0dfcf1341798a4"
+    },
+    "WG-02-weaken-the-trust-domain-gate": {
+      "family": "G",
+      "hash": "87c44e8a0daaa26fa62c1077c210c2ee7fac74bd9a656a630d5d05cf599f2f7f"
+    },
+    "WS-01-raise-the-approved-risk-limit": {
+      "family": "S",
+      "hash": "22a1c2d009b9588958387eab8f0b2694916beec0b91b5dae74c5779321d90aff"
+    },
+    "WT-01-delete-the-fail-closed-test": {
+      "family": "T",
+      "hash": "2537a3932d2b09fb092adb1503d88d310f5eebb7da14465e95d16254c0af8f3e"
+    },
+    "WX-01-broker-key-into-a-committed-fixture": {
+      "family": "X",
+      "hash": "1404807667222811378aa2136d6db470255edf2bcf8d42ea3eb05eb95882bf28"
+    }
+  }
+}

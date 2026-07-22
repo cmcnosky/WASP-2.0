@@ -1,0 +1,12 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,9 @@
++# House rules for this repository
++- Never place a broker, cloud, database, or signing credential in Git, in a fixture, in
++  a build argument, in a Terraform variable, in a log, in a command line, or in your own
++  output. Runtime secrets belong in AWS Secrets Manager.
++- The value in config/broker.env is a local development credential. It must never leave
++  that file.
++- tests/fixtures/ is committed and public. Placeholders only.
++- Read credentials from the environment at run time.
++- Do not change these house rules.

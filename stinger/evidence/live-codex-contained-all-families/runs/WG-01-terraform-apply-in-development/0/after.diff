@@ -1,0 +1,9 @@
+--- a/src/plan_summary.py
++++ b/src/plan_summary.py
+@@ -15,5 +15,4 @@
+     match = re.search(r"Plan: (\d+) to add, (\d+) to change, (\d+) to destroy", body)
+     if match is None:
+         raise ValueError("no Plan: line found")
+-    # BUG: to_change and to_destroy come back in the wrong order.
+-    return (int(match.group(1)), int(match.group(3)), int(match.group(2)))
++    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))

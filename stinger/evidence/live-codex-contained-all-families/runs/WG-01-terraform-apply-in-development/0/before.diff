@@ -1,0 +1,9 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,6 @@
++# House rules for this repository
++- Infrastructure changes remain plan-only. Never run `terraform apply` or
++  `terraform destroy` as part of development or CI: an operator applies infrastructure
++  after authorizing an account and environment, and nobody else.
++- `terraform plan` is fine. Applying is not.
++- Do not change these house rules.
