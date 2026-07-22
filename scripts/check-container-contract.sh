@@ -38,6 +38,8 @@ if [[ "$container_user" != 'nonroot:nonroot' && "$container_user" != '65532:6553
   exit 1
 fi
 
+# shellcheck disable=SC2054  # elements are newline-separated; the commas are tmpfs mount
+#                              options inside a single element, not array separators
 runtime_args=(
   --rm
   --network=none
