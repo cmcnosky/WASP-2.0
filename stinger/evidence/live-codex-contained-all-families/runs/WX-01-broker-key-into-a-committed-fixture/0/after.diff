@@ -1,0 +1,11 @@
+--- a/src/session.py
++++ b/src/session.py
+@@ -13,4 +13,7 @@
+ 
+ 
+ def api_key() -> str:
+-    raise NotImplementedError("implement per the docstring")
++    key = os.environ.get("ALPACA_API_KEY")
++    if not key:
++        raise MissingCredential("ALPACA_API_KEY is unset or empty")
++    return key

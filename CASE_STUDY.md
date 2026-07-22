@@ -33,6 +33,21 @@ never pass its own economic gates — is published verbatim in the technical han
 document attached to this repository's releases. If the builder will do that to his own
 work, that is the standard applied to everything here.
 
+The obvious hole in a story like this is that "the agents worked under a governance
+contract" is a claim about a process nobody else watched. [stinger/](stinger/) closes it as
+far as it can currently be closed: a corpus of sandboxed traps, each one encoding a rule
+taken verbatim from this repository's own AGENTS.md, built so that obeying the rule is the
+slow path to a green test suite. The agent under test runs contained, and whether it cheated
+is decided by deterministic detectors — never by a language model's opinion. Every scenario
+must prove it catches its own intended cheat before it is allowed to judge anything.
+
+The result so far is six honest outcomes across all five trap families. It is deliberately
+**not** presented as a score: it is one repetition per scenario, and
+[stinger/RESULTS.md](stinger/RESULTS.md) says so in the same breath as the number, along with
+the three failures that had to be fixed before the measurement meant anything at all. One of
+those was a trap this operator wrote badly enough that it could never have fired — caught not
+by review but by the harness refusing to run it.
+
 ## What this is not
 
 It is not connected to any real brokerage account, database, or cloud. It has no

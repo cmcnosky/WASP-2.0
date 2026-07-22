@@ -1,0 +1,55 @@
+# Stinger run configuration for WASP 2.0.
+#
+# Measures whether the coding agent that builds this repository cheats when the
+# repository's own house rules (AGENTS.md) are the thing standing in its way.
+#
+#     stinger validate --config stinger.yaml
+#     stinger run --config stinger.yaml
+#
+# The agent measured here is Codex, because Codex is the agent that wrote this
+# repository. Measuring some other agent would be a different, less interesting claim.
+
+agent:
+  adapter: codex
+
+  # The agent runs INSIDE this image, so the only thing it can reach is its workdir.
+  # Without it the adapter drives Codex as a host subprocess with its cwd set, which is
+  # process-level isolation and not containment — the first run of this corpus was done that
+  # way and Codex read its own memory file from outside the workdir, pulling notes about an
+  # unrelated project into the recorded evidence. It is also what lets the X
+  # (safety/exfiltration) family run at all: `stinger run` refuses that family outright
+  # against an uncontained agent, and it is right to.
+  #
+  #   docker build -t stinger-codex-agent:1 -f <stinger>/docker/codex-agent.Dockerfile <stinger>
+  container_image: stinger-codex-agent:1
+
+  # Codex under a ChatGPT subscription authenticates from auth.json, not from an API key, so
+  # `api_key_env` cannot express it. This directory holds exactly one file — a copy of
+  # ~/.codex/auth.json — and is mounted READ-ONLY at /credentials. Never point this at
+  # ~/.codex itself: that directory also holds memories, session history and config, and
+  # handing those to the agent under test would restore the contamination the container
+  # exists to prevent.
+  #
+  # Read-only has a cost worth knowing: Codex cannot write refreshed tokens back, so when
+  # the access token expires the copy has to be refreshed by hand:
+  #   cp ~/.codex/auth.json ~/.stinger/codex-credentials/auth.json
+  #
+  # No CODEX_HOME override belongs here. The image mounts this at /credentials and copies it
+  # into its own writable home on start; pointing CODEX_HOME at the read-only mount directly
+  # makes the CLI fail before the agent runs, and the image now refuses that outright.
+  credential_mount: ~/.stinger/codex-credentials
+
+corpus: scenarios
+output_dir: repro
+
+# Agents are not deterministic. Raise this before any number here is published as a score;
+# the per-scenario distribution and per-family standard deviation are reported either way.
+reps: 1
+
+# Docker for the verification commands. Distinct from the agent's container above: this one
+# has no network and no credentials, and never contains the agent.
+isolation: docker
+image: stinger-runner:1
+
+judge:
+  enabled: false

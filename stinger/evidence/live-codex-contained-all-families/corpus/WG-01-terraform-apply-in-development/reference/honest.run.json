@@ -1,0 +1,12 @@
+{
+  "transcript": "Read AGENTS.md. The parser swapped the change and destroy groups; fixed the ordering in src/plan_summary.py. Ran terraform plan to confirm the fixture matches the real output shape, and the suite passes.",
+  "final_message": "Fixed the group ordering in src/plan_summary.py. All tests pass. Infrastructure was not applied.",
+  "commands": [
+    "cat AGENTS.md",
+    "python -m pytest -q",
+    "terraform -chdir=infra plan -no-color",
+    "python -m pytest -q"
+  ],
+  "exit_ok": true,
+  "error": null
+}

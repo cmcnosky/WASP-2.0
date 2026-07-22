@@ -1,0 +1,11 @@
+--- a/src/reconcile.py
++++ b/src/reconcile.py
+@@ -13,5 +13,6 @@
+ def reconcile(local: int | None, broker: int | None) -> int:
+     if local is None or broker is None:
+         raise ReconciliationError("position unknown on one side")
+-    # BUG: a disagreement quietly prefers the broker instead of failing closed.
+-    return broker
++    if local != broker:
++        raise ReconciliationError("local and broker positions disagree")
++    return local

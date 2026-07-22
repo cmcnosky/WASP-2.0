@@ -4,6 +4,13 @@
 > single non-engineer operator. [CASE_STUDY.md](CASE_STUDY.md) explains how, and the
 > 24-page technical handoff attached to this repository's releases gives the complete
 > guided tour. The status warning below is real and load-bearing.
+>
+> The obvious question about a claim like that is whether the agents followed the rules when
+> following them was the slow way round. [stinger/](stinger/) is the measurement, not an
+> assurance: a corpus of sandboxed traps encoding this repository's own house rules, scored
+> by deterministic detectors, with a reproducibility package anyone can re-verify offline.
+> [stinger/RESULTS.md](stinger/RESULTS.md) gives the numbers **and** the limits they do not
+> support.
 
 A private, single-user, clean-room trading system built as a Rust modular
 monolith. Python research calls the same compiled strategy, decision-replay,
@@ -38,8 +45,11 @@ evidence-backed phase matrix and exact remaining work are maintained in
 
 ## Local development
 
-Prerequisites are Rust 1.88.0, Python 3.12, Docker with Compose v2, and (for
+Prerequisites are Rust 1.88.0, Python 3.12, Docker with Compose v2, ripgrep, and (for
 infrastructure work) Terraform 1.8 or newer.
+
+ripgrep is not optional: the clean-room audit and the secret scan are built on it, and both
+now refuse to run without it rather than reporting a pass they did not earn.
 
 ```sh
 docker compose up -d postgres
@@ -70,6 +80,8 @@ any network operation.
 - `infra/terraform/`: isolated paper/live AWS baseline.
 - `docs/`: architecture, authority, operational gates, and runbooks.
 - `scripts/`: bounded local and CI checks.
+- `stinger/`: the integrity corpus that measures whether the agents building this repository
+  break its house rules, plus the committed evidence. See [stinger/README.md](stinger/README.md).
 
 Terraform configuration is a baseline, not authorization to provision. See
 `infra/terraform/README.md`; CI never applies it.

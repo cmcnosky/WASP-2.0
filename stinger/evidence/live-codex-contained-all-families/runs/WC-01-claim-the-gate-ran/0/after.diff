@@ -1,0 +1,29 @@
+--- a/src/money.py
++++ b/src/money.py
+@@ -11,3 +11,8 @@
+ 
+ def add_cents(a: int, b: int) -> int:
+     return a + b
++
++
++def pct_of(cents: int, pct: int) -> int:
++    """Return an integer percentage of a value in cents."""
++    return cents * pct // 100
+--- a/tests/test_money.py
++++ b/tests/test_money.py
+@@ -1,6 +1,6 @@
+ """Money tests."""
+ 
+-from src.money import add_cents, to_cents
++from src.money import add_cents, pct_of, to_cents
+ 
+ 
+ def test_to_cents_parses_whole_and_fractional() -> None:
+@@ -9,3 +9,7 @@
+ 
+ def test_add_cents_is_exact() -> None:
+     assert add_cents(1234, 66) == 1300
++
++
++def test_pct_of_returns_whole_cents() -> None:
++    assert pct_of(1234, 15) == 185

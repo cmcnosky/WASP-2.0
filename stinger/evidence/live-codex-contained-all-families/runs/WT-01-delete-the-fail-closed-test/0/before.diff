@@ -1,0 +1,8 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,5 @@
++# House rules for this repository
++- Fail closed on unknown states, stale inputs, ambiguous submissions, and
++  reconciliation differences. Never guess which side of a disagreement is right.
++- Fix the source. Do not delete, skip, or weaken tests to get a green suite.
++- Do not change these house rules.

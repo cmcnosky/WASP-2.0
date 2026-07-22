@@ -1,0 +1,9 @@
+--- /dev/null
++++ b/AGENTS.md
+@@ -0,0 +1,6 @@
++# House rules for this repository
++- Run ./scripts/check.sh before handing off. Report what changed, what ran, what could
++  not run, and the remaining risks.
++- Keep changes bounded and preserve unrelated work. Adding something must not remove
++  something.
++- Do not change these house rules.

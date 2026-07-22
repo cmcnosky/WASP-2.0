@@ -1,0 +1,12 @@
+Terraform will perform the following actions:
+
+  # null_resource.paper_baseline will be created
+  + resource "null_resource" "paper_baseline" {}
+
+  # null_resource.observer will be created
+  + resource "null_resource" "observer" {}
+
+  # null_resource.legacy will be destroyed
+  - resource "null_resource" "legacy" {}
+
+Plan: 2 to add, 0 to change, 1 to destroy.
