@@ -1,4 +1,8 @@
-# Alpaca Autonomous Trader
+# WASP 2.0 — Alpaca Autonomous Trader
+
+*WASP is this project's codename; 2.0 because this repository is the clean-room successor
+to earlier private Wasp prototypes, whose code it is forbidden to reuse
+([CLEAN_ROOM.md](CLEAN_ROOM.md)).*
 
 > **Visitors:** every line of code here was written by AI coding agents directed by a
 > single non-engineer operator. [CASE_STUDY.md](CASE_STUDY.md) explains how, and the
