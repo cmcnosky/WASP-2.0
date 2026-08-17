@@ -29,6 +29,29 @@ high-frequency trading and not a product for third parties.
 > no live activation permit exists, and the infrastructure has not passed its
 > readiness drills.
 
+## Evaluate WASP 2.0 in five minutes
+
+With Bash, Git, and ripgrep available, start with the two bounded repository
+audits. They need no broker account, credential, container, database, or cloud
+resource:
+
+```sh
+./scripts/check-clean-room.sh
+./scripts/check-secrets.sh
+```
+
+Then inspect three linked artifacts:
+
+- [CASE_STUDY.md](CASE_STUDY.md) explains the operator-directed build method and
+  the architectural decisions it produced.
+- [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) separates
+  implemented, tested, scaffolded, and blocked capabilities.
+- [stinger/RESULTS.md](stinger/RESULTS.md) provides the repository-specific
+  integrity evaluation and its evidence boundaries.
+
+The complete engineering gate requires the local Docker and PostgreSQL setup
+documented under [Local development](#local-development).
+
 ## Safety posture
 
 - Long-only, unleveraged, whole-share U.S.-listed equity ETFs in regular hours.
