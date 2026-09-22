@@ -1,64 +1,67 @@
-# How this repository was built (a note for visitors)
+# WASP 2.0 — design notes and evidence
 
-Every line of code in this repository was written by AI coding agents — OpenAI Codex
-built the system, with Claude (Anthropic) used for independent audit and analysis. It
-was directed by a single operator with no software employment history and no computer
-science degree: a former homebuilder purchasing manager who runs a small manufacturing
-business.
+WASP 2.0 is a single-user trading-system project built around a Rust core,
+a Python research interface, and a PostgreSQL ledger. Its central engineering
+question is how to keep research and execution consistent while making broker
+actions subject to explicit authority, durable records, and reconciliation.
 
-That is not a confession. It is the experiment.
+**Operating status: HOLD — do not trade.** The repository's implementation
+record and live-readiness gates define the current boundaries. A test result
+or completed build does not authorize activation.
 
-## What the operator actually did
+## Project direction
 
-"Prompted an AI" does not describe it, so here is what the human contributed:
+Chris McNosky directs the project scope, architecture, acceptance criteria,
+review, correction requirements, and release decisions. The working agreements
+in [AGENTS.md](AGENTS.md) require evidence for those decisions and prohibit the
+software from approving its own release or clearing its own hard halts.
 
-- **The constitution.** [AGENTS.md](AGENTS.md) is a working-agreements contract every
-  agent session ingests before touching the code: fail closed on anything unverifiable,
-  never weaken a gate to make a test pass, software may not approve its own release or
-  clear its own halts.
-- **Mechanical distrust.** A change is done when [`./scripts/check.sh`](scripts/check.sh)
-  passes — clean-room audit, secret scan, the full Rust/Python/SQL test suites,
-  cross-language parity, database invariant and race checks. No one's self-report is
-  trusted here, including the AI's, including the operator's.
-- **Enforced honesty.** [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md)
-  grades every capability by evidence — *offline verified*, *structural only*, or
-  *absent* — and the system's standing posture is **HOLD — do not trade** until real
-  evidence exists. There are no TODOs and no stubs in ~32,000 lines of Rust: everything
-  either works as verified or refuses to run.
-- **Provenance.** [CLEAN_ROOM.md](CLEAN_ROOM.md): blank Git history, no prior-project
-  material, every external input recorded. The audit trail is the entire point.
+## Engineering decisions to inspect
 
-An independent AI audit of the whole project — including the parts that conclude it may
-never pass its own economic gates — is published verbatim in the technical handoff
-document attached to this repository's releases. If the builder will do that to his own
-work, that is the standard applied to everything here.
+### One shared strategy and risk core
 
-The obvious hole in a story like this is that "the agents worked under a governance
-contract" is a claim about a process nobody else watched. [stinger/](stinger/) closes it as
-far as it can currently be closed: a corpus of sandboxed traps, each one encoding a rule
-taken verbatim from this repository's own AGENTS.md, built so that obeying the rule is the
-slow path to a green test suite. The agent under test runs contained, and whether it cheated
-is decided by deterministic detectors — never by a language model's opinion. Every scenario
-must prove it catches its own intended cheat before it is allowed to judge anything.
+The [Rust core](crates/trader-core/src/) contains the strategy, risk, replay,
+and accounting logic. The [PyO3 bridge](crates/alpaca-autotrader-py/src/lib.rs)
+exposes compiled behavior to Python research. This makes cross-language
+consistency an explicit test target; see the
+[compiled bridge parity checks](crates/alpaca-autotrader-py/tests/compiled_bridge_parity.py).
 
-The result so far is six honest outcomes across all five trap families. It is deliberately
-**not** presented as a score: it is one repetition per scenario, and
-[stinger/RESULTS.md](stinger/RESULTS.md) says so in the same breath as the number, along with
-the three failures that had to be fixed before the measurement meant anything at all. One of
-those was a trap this operator wrote badly enough that it could never have fired — caught not
-by review but by the harness refusing to run it.
+### Durable order intent and reconciliation
 
-## What this is not
+The execution layer records intent before submission. Ambiguous broker outcomes
+require reconciliation against stable order identity. The relevant starting
+points are [durable submission](crates/trader-execution/src/durable_submission.rs),
+[reconciliation](crates/trader-execution/src/reconciliation.rs), and the
+[order-safety regression tests](crates/trader-execution/tests/order_safety.rs).
 
-It is not connected to any real brokerage account, database, or cloud. It has no
-evidence its trading strategy works, and its own documents treat "no strategy ever
-qualifies" as a valid final outcome. It is not investment advice, not a product, and
-not a claim that AI replaces engineers. It is one datapoint about what a disciplined
-non-engineer can now direct AI to build — with the receipts public so you can judge
-the claim yourself.
+### Explicit authority and readiness
+
+Paper and live environments have separate configuration and broker hosts.
+Readiness, human-approved activation, and halt handling are defined in
+[the live-readiness contract](docs/LIVE_READINESS.md). The
+[implementation-status matrix](docs/IMPLEMENTATION_STATUS.md) distinguishes
+verified mechanisms, structural work, and remaining requirements.
+
+### Evidence retained with the implementation
+
+[The engineering gate](scripts/check.sh) includes repository audits and
+Rust, Python, compiled-bridge, and database checks. The repository-specific
+[integrity evaluation](stinger/RESULTS.md) retains its scenario results and
+measurement limits. [The clean-room record](CLEAN_ROOM.md) documents source
+provenance and the boundary against reusing earlier implementations.
+
+## Review path
+
+1. Read [the architecture](docs/ARCHITECTURE.md) for the module and authority boundaries.
+2. Trace an order through the execution code and its tests.
+3. Compare the behavior with [implementation status](docs/IMPLEMENTATION_STATUS.md).
+4. Inspect [CI](https://github.com/cmcnosky/WASP-2.0/actions/workflows/ci.yml) and [dependency and image checks](https://github.com/cmcnosky/WASP-2.0/actions/workflows/security.yml) for the revision under review.
+
+The current research path is a provider-free synthetic mechanics harness.
+Real research, broker readiness, and activation require their own evidence;
+the project makes no claim of demonstrated trading profitability.
 
 ## Contact
 
-Chris McNosky · Dallas–Fort Worth, TX · cmcnosky@gmail.com
-Available for AI-systems direction, agent-governance consulting, and roles where
-"make AI-built software provably trustworthy" is the job.
+Chris McNosky · Dallas–Fort Worth, TX · cmcnosky@gmail.com ·
+[Project portfolio](https://cmcnosky.github.io/)

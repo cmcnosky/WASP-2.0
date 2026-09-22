@@ -1,49 +1,45 @@
 # WASP 2.0 — Alpaca Autonomous Trader
 
-*WASP is this project's codename; 2.0 because this repository is the clean-room successor
-to earlier private Wasp prototypes, whose code it is forbidden to reuse
-([CLEAN_ROOM.md](CLEAN_ROOM.md)).*
+A single-user trading-system project built as a Rust modular monolith with a
+Python research interface through PyO3 and a PostgreSQL evidence ledger. The
+architecture centers on durable order intents, reconciliation, fixed-point
+accounting, and explicit authorization for broker actions.
 
-> **Visitors:** every line of code here was written by AI coding agents directed by a
-> single non-engineer operator. [CASE_STUDY.md](CASE_STUDY.md) explains how, and the
-> 24-page technical handoff attached to this repository's releases gives the complete
-> guided tour. The status warning below is real and load-bearing.
->
-> The obvious question about a claim like that is whether the agents followed the rules when
-> following them was the slow way round. [stinger/](stinger/) is the measurement, not an
-> assurance: a corpus of sandboxed traps encoding this repository's own house rules, scored
-> by deterministic detectors, with a reproducibility package anyone can re-verify offline.
-> [stinger/RESULTS.md](stinger/RESULTS.md) gives the numbers **and** the limits they do not
-> support.
-
-A private, single-user, clean-room trading system built as a Rust modular
-monolith. Python research calls the same compiled strategy, decision-replay,
-and risk core through PyO3; performance replay is currently limited to a
-provider-free synthetic mechanics harness and rejects every real research
-stage. The target is reliable
-low-frequency automation over an Alpaca personal brokerage account—not
-high-frequency trading and not a product for third parties.
+Python research calls the same compiled strategy, decision-replay, and risk
+core. Performance replay currently supports a provider-free synthetic mechanics
+harness and rejects real research stages. The intended operating scope is
+low-frequency automation for one Alpaca account.
 
 > **Current status: HOLD — do not trade.** This repository is under
 > construction. No strategy is certified, no Alpaca entitlement is confirmed,
 > no live activation permit exists, and the infrastructure has not passed its
 > readiness drills.
 
-## Evaluate WASP 2.0 in five minutes
+## Inspect the engineering in five minutes
 
-With Bash, Git, and ripgrep available, start with the two bounded repository
+| Question | Entry point |
+|---|---|
+| How are strategy, risk, and execution separated? | [Architecture](docs/ARCHITECTURE.md) and [shared Rust core](crates/trader-core/src/) |
+| What happens after an uncertain broker response? | [Durable submission](crates/trader-execution/src/durable_submission.rs), [reconciliation](crates/trader-execution/src/reconciliation.rs), and [order-safety tests](crates/trader-execution/tests/order_safety.rs) |
+| How does Python share the Rust implementation? | [PyO3 bridge](crates/alpaca-autotrader-py/src/lib.rs) and [compiled parity tests](crates/alpaca-autotrader-py/tests/compiled_bridge_parity.py) |
+| What is implemented, and what remains? | [Implementation-status matrix](docs/IMPLEMENTATION_STATUS.md) and [live-readiness gates](docs/LIVE_READINESS.md) |
+
+## Run the bounded repository checks
+
+With Bash, Git, and ripgrep available, start from a clone and run the two bounded repository
 audits. They need no broker account, credential, container, database, or cloud
 resource:
 
 ```sh
+git clone https://github.com/cmcnosky/WASP-2.0.git
+cd WASP-2.0
 ./scripts/check-clean-room.sh
 ./scripts/check-secrets.sh
 ```
 
 Then inspect three linked artifacts:
 
-- [CASE_STUDY.md](CASE_STUDY.md) explains the operator-directed build method and
-  the architectural decisions it produced.
+- [CASE_STUDY.md](CASE_STUDY.md) summarizes the engineering decisions and evidence.
 - [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) separates
   implemented, tested, scaffolded, and blocked capabilities.
 - [stinger/RESULTS.md](stinger/RESULTS.md) provides the repository-specific
