@@ -84,6 +84,29 @@ The Rust 1.88 floor admits the PyO3 release that resolves the current RustSec
 advisories while remaining an exact, reproducible toolchain. Dependabot
 proposals repeat maintenance, license, MSRV, API, and safety review.
 
+## Manifest and security reconciliation — 2026-09-22
+
+The table above is a historical review record. The current direct pins in
+`Cargo.toml` differ in these entries: `async-trait 0.1.91`, `clap 4.6.3`,
+`serde_json 1.0.151`, `uuid 1.24.0`, and `rustls 0.23.45`. This reconciliation
+records the manifest state; it does not backdate a new review of every package.
+
+The security update pins `rustls 0.23.45` to address
+[RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285.html).
+Its required lockfile updates include `rustls-webpki 0.103.15`,
+`aws-lc-rs 1.18.1`, and `aws-lc-sys 0.45.0`. The lockfile also replaces yanked
+`chacha20 0.10.1` with `0.10.2`; it remains a transitive dependency. Package
+sources: [rustls](https://crates.io/crates/rustls/0.23.45) and
+[chacha20](https://crates.io/crates/chacha20/0.10.2).
+
+Local validation passed formatting, all-target/all-feature locked Clippy,
+205 focused Rust tests, and `cargo audit --deny warnings` with no findings.
+The full repository check reached the PyO3 workspace test and failed to link
+Python C symbols on the macOS arm64 host. The pinned Linux compiled-Python,
+PostgreSQL, Terraform, and container gates remain subject to the exact commit's
+[CI results](https://github.com/cmcnosky/WASP-2.0/actions/workflows/ci.yml).
+These dependency changes do not authorize deployment or trading.
+
 ### Release license gate
 
 **HOLD — do not deploy externally or activate paper/live execution** until CI
