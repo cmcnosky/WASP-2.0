@@ -28,7 +28,7 @@ serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = { version = "=1.0.151", features = ["arbitrary_precision"] }
 sha2 = "=0.10.8"
 thiserror = "=1.0.63"
-tokio = { version = "=1.53.0", features = ["macros", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
+tokio = { version = "=1.53.1", features = ["macros", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 tokio-postgres = { version = "=0.7.18", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 tokio-postgres-rustls = { version = "=0.14.0", default-features = false, features = ["aws-lc-rs"] }
 tracing = "=0.1.44"
