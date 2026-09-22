@@ -1,5 +1,8 @@
 \set ON_ERROR_STOP on
 
+-- Keep the lower authority bounds aligned with the historical decision fixtures below.
+-- The read models evaluate the upper bounds against wall-clock time, so those bounds must
+-- remain active whenever the suite runs rather than expiring on a calendar date.
 INSERT INTO strategy_releases (
     release_id, name, version, release_hash, code_hash, parameters_hash, universe_hash,
     data_hash, cost_model_hash, certificate_hash, status, valid_from, valid_until
@@ -16,7 +19,7 @@ INSERT INTO strategy_releases (
     repeat('f', 64),
     'certified',
     '2026-07-18T00:00:00Z',
-    '2026-08-18T00:00:00Z'
+    clock_timestamp() + INTERVAL '1 day'
 );
 
 INSERT INTO activation_permits (
@@ -35,7 +38,7 @@ INSERT INTO activation_permits (
     100.00,
     repeat('0', 64),
     '2026-07-18T00:00:00Z',
-    '2026-08-18T00:00:00Z',
+    clock_timestamp() + INTERVAL '1 day',
     'operator-test',
     repeat('1', 64)
 );
@@ -152,7 +155,7 @@ INSERT INTO activation_permits (
     100.00,
     repeat('5', 64),
     '2026-07-18T00:00:00Z',
-    '2026-08-18T00:00:00Z',
+    clock_timestamp() + INTERVAL '1 day',
     'operator-test',
     repeat('9', 64)
 );
