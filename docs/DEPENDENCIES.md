@@ -107,6 +107,31 @@ PostgreSQL, Terraform, and container gates remain subject to the exact commit's
 [CI results](https://github.com/cmcnosky/WASP-2.0/actions/workflows/ci.yml).
 These dependency changes do not authorize deployment or trading.
 
+## Rustls security update — 2026-10-19
+
+The exact direct pin and lockfile now select `rustls 0.23.46`, addressing
+[RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346),
+[RUSTSEC-2026-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347),
+[RUSTSEC-2026-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348), and
+[RUSTSEC-2026-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349).
+The [upstream release](https://github.com/rustls/rustls/releases/tag/v%2F0.23.46)
+and [registry package](https://crates.io/crates/rustls/0.23.46) retain the Rust
+1.71 minimum, dependency requirements, and feature definitions from `0.23.45`.
+The selected AWS-LC provider, TLS features, and certificate/hostname validation
+policy are unchanged. This update does not authorize deployment or trading.
+
+Local Linux validation with Rust 1.88.0 passed formatting, all-target/all-feature
+locked Clippy, all 205 Rust tests, 40 Python tests, and native compiled PyO3/CLI
+parity. `cargo audit 0.22.2 --deny warnings` passed against 1,338 advisories and
+273 locked crate dependencies. The required `./scripts/check.sh` stopped at
+the Docker-only compiled parity step because Docker was unavailable; the pinned
+container, PostgreSQL, and Terraform gates remain unverified. ShellCheck 0.11.0,
+Ruff 0.11.2, Mypy 1.15.0, and the 40-test pytest run subsequently passed.
+Terraform 1.8.5 formatting and locked-provider initialization passed, but
+validation could not start provider plugins because the test sandbox denied
+their local Unix sockets; mocked plan tests therefore did not run. The native
+parity pass does not replace the pinned container gate.
+
 ### Release license gate
 
 **HOLD — do not deploy externally or activate paper/live execution** until CI
