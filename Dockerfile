@@ -14,7 +14,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     cargo build --locked --release --package "${APP_PACKAGE}" && \
     cp "/build/target/release/${APP_PACKAGE}" /tmp/alpaca-autotrader
 
-FROM gcr.io/distroless/cc-debian12:nonroot@sha256:66aa873a4a14fb164aa01296058efd8253744606d72715e45acface073359faa AS runtime
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:fccdbb0a547c14e23fcf4ce8ad62ca5d43b4faae8d22cd292f490fef9946c96e AS runtime
 
 COPY --from=builder --chown=65532:65532 /tmp/alpaca-autotrader /app/alpaca-autotrader
 
